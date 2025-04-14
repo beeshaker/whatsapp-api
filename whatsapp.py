@@ -252,11 +252,18 @@ def send_whatsapp_tickets(to):
 
 
 # Webhook route to handle incoming messages
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    if request.method == "GET":
+        verify_token = "12345"  # Make sure this matches the one you set in Meta
+
+        if request.args.get("hub.verify_token") == verify_token:
+            return request.args.get("hub.challenge"), 200
+        return "Invalid verification token", 403
+
+    # POST: Handle webhook events
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
-    # Immediately return 200 OK to prevent WhatsApp retries
     response = jsonify({"status": "received"})
     threading.Thread(target=process_webhook, args=(data,)).start()
     return response, 200
