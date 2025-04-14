@@ -352,4 +352,4 @@ def process_webhook(data):
 
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)  # ⚠️ Disabled debug mode to prevent duplicate processing
+    app.run(port=5000, debug=False)  # ⚠️ Disabled debug mode to prevent duplicate processing
