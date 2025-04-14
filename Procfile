@@ -1,1 +1,1 @@
-echo web: gunicorn whatsapp:app > Procfile
+web: gunicorn whatsapp:app
