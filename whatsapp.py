@@ -7,7 +7,7 @@ import logging
 import threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from conn1 git import get_db_connection1, save_ticket_media
+from conn1 import get_db_connection1, save_ticket_media
 from sqlalchemy.sql import text
 import threading
 import datetime
