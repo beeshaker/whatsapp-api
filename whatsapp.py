@@ -269,6 +269,25 @@ def webhook():
     return response, 200
 
 
+@app.route("/send_message", methods=["POST"])
+def external_send_message():
+    data = request.get_json()
+    api_key = request.headers.get("X-API-KEY")  # Optional security
+
+    if api_key != os.getenv("INTERNAL_API_KEY"):  # secure communication
+        return jsonify({"error": "Unauthorized"}), 401
+
+    to = data.get("to")
+    message = data.get("message")
+    
+    if not to or not message:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    result = send_whatsapp_message(to, message)
+    return jsonify(result), 200
+
+
+
 
 
 def process_webhook(data):
