@@ -57,4 +57,4 @@ def insert_ticket_and_get_id(user_id, description, category, property, assigned_
         })
         result = conn.execute(select_query).fetchone()
         conn.commit()
-        return result["id"]
+        return result[0]

@@ -108,7 +108,7 @@ def send_category_prompt(to):
     send_whatsapp_message(to, message)
 
     # Set timeout to reset user status if they don't respond within 5 minutes
-    user_timers[to] = datetime.datetime.now()
+    user_timers[to] = datetime.now()
     threading.Thread(target=reset_category_selection, args=(to,)).start()
     
 def reset_category_selection(to):
@@ -117,7 +117,7 @@ def reset_category_selection(to):
     last_attempt_time = user_timers.get(to)
     
     if last_attempt_time:
-        elapsed_time = (datetime.datetime.now() - last_attempt_time).total_seconds()
+        elapsed_time = (datetime.now() - last_attempt_time).total_seconds()
         if elapsed_time >= 300:  # If still waiting after 5 minutes
             logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
             query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
