@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from conn1 import get_db_connection1, save_ticket_media
 from sqlalchemy.sql import text
 import threading
-import datetime
+from datetime import datetime
 
 # Dictionary to track category selection timeouts
 
@@ -262,8 +262,7 @@ def send_whatsapp_tickets(to):
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        verify_token = "12345"  # Make sure this matches the one you set in Meta
-
+        verify_token = "12345"  # Make sure this matches your Meta settings
         if request.args.get("hub.verify_token") == verify_token:
             return request.args.get("hub.challenge"), 200
         return "Invalid verification token", 403
@@ -271,9 +270,11 @@ def webhook():
     # POST: Handle webhook events
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
-    response = jsonify({"status": "received"})
-    threading.Thread(target=process_webhook, args=(data,)).start()
-    return response, 200
+
+    # ✅ Process inline to prevent duplicate processing
+    process_webhook(data)
+
+    return jsonify({"status": "received"}), 200
 
 
 @app.route("/send_message", methods=["POST"])
@@ -393,7 +394,7 @@ def process_webhook(data):
                                 base_filename = f"{media_id}.mp4"
 
                             # Add timestamp to filename
-                            from datetime import datetime
+                            
                             name, ext = os.path.splitext(base_filename)
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             filename = f"{name}_{timestamp}{ext}"
