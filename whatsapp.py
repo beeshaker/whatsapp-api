@@ -279,12 +279,47 @@ def external_send_message():
 
     to = data.get("to")
     message = data.get("message")
-    
+    template_name = data.get("template_name")
+    template_parameters = data.get("template_parameters", [])
+
     if not to or not message:
         return jsonify({"error": "Missing required fields"}), 400
+    
+    if template_name:
+            result = send_template_message(to, template_name, template_parameters)
+    elif message:
+        result = send_whatsapp_message(to, message)
+    else:
+        return jsonify({"error": "Either message or template_name must be provided"}), 400
 
     result = send_whatsapp_message(to, message)
     return jsonify(result), 200
+
+
+def send_template_message(to, template_name, parameters):
+    url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": { "code": "en_US" },
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": p} for p in parameters]
+            }]
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    logging.info(f"Sent WhatsApp template message: {response.json()}")
+    return response.json()
 
 
 
