@@ -381,7 +381,11 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id = message.get("id")
                         sender_id = message["from"]
-                        message_text = message.get("text", {}).get("body", "").strip()
+                        message_text =""
+                        if "text" in message:
+                            message_text = message.get("text", {}).get("body", "").strip()
+                        elif message.get("type") in ["image", "video", "document"]:
+                            message_text = message[message["type"]].get("caption", "").strip()
 
                         # ✅ Handle media uploads (document, image, video)
                         media_type = message.get("type")
@@ -476,6 +480,8 @@ def process_webhook(data):
 
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
+                                if sender_id in user_timers:
+                                    del user_timers[sender_id]
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
                             continue
