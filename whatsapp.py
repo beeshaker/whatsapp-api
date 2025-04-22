@@ -7,7 +7,7 @@ import logging
 import threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from conn1 import get_db_connection1
+from conn1 git import get_db_connection1, save_ticket_media
 from sqlalchemy.sql import text
 import threading
 import datetime
@@ -37,6 +37,8 @@ logging.basicConfig(level=logging.INFO)
 processed_message_ids = set()
 last_messages = {}  # { sender_id: (message_text, timestamp) }
 user_timers = {}
+media_buffer = {}  # global store for media before ticket creation
+
 
 
 def opt_in_user(whatsapp_number):
@@ -102,7 +104,7 @@ def query_database(query, params=(), commit=False):
     
 def send_category_prompt(to):
     """Asks the user to select a category for the ticket."""
-    message = "Please select a category:\n1️⃣ Accounts\n2️⃣ Maintenance\n3️⃣ Security\nReply with the number."
+    message = "Please select a category:\n1️⃣ Accounts\n2️⃣ Maintenance\n3️⃣ Security\n4️⃣ Other\n\nReply with the number."
     send_whatsapp_message(to, message)
 
     # Set timeout to reset user status if they don't respond within 5 minutes
@@ -125,9 +127,14 @@ def reset_category_selection(to):
 
 
 def get_category_name(category_number):
-    """Returns the category name based on the user's selection."""
-    categories = {"1": "Accounts", "2": "Maintenance", "3": "Security"}
+    categories = {
+        "1": "Accounts",
+        "2": "Maintenance",
+        "3": "Security",
+        "4": "Other"  # ✅ Added new option
+    }
     return categories.get(category_number, None)
+
 
 # Prevent duplicate message processing
 def is_message_processed(message_id):
@@ -322,7 +329,38 @@ def send_template_message(to, template_name, parameters):
     return response.json()
 
 
+def download_media(media_id, filename=None):
+    """Downloads WhatsApp media and saves it to a timestamped file in /tmp."""
+    # Step 1: Get the media URL
+    meta_url = f"https://graph.facebook.com/v22.0/{media_id}"
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    media_response = requests.get(meta_url, headers=headers)
 
+    if media_response.status_code != 200:
+        return {"error": "Failed to fetch media URL", "details": media_response.text}
+
+    media_url = media_response.json().get("url")
+    if not media_url:
+        return {"error": "Media URL not found"}
+
+    # Step 2: Download the file
+    media_file_response = requests.get(media_url, headers=headers)
+    if media_file_response.status_code != 200:
+        return {"error": "Failed to download media", "details": media_file_response.text}
+
+    # Step 3: Build a unique timestamped filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not filename:
+        filename = f"{media_id}_{timestamp}.bin"
+    else:
+        name, ext = os.path.splitext(filename)
+        filename = f"{name}_{timestamp}{ext}"
+
+    save_path = os.path.join("/tmp", filename)
+    with open(save_path, "wb") as f:
+        f.write(media_file_response.content)
+
+    return {"success": True, "path": save_path}
 
 
 def process_webhook(data):
@@ -341,17 +379,45 @@ def process_webhook(data):
                         sender_id = message["from"]
                         message_text = message.get("text", {}).get("body", "").strip()
 
+                        # ✅ Handle media uploads (document, image, video)
+                        media_type = message.get("type")
+                        if media_type in ["document", "image", "video"]:
+                            media_id = message[media_type]["id"]
+                            
+                            # Build base filename
+                            if media_type == "document":
+                                base_filename = message[media_type].get("filename", f"{media_id}.pdf")
+                            elif media_type == "image":
+                                base_filename = f"{media_id}.jpg"
+                            elif media_type == "video":
+                                base_filename = f"{media_id}.mp4"
+
+                            # Add timestamp to filename
+                            from datetime import datetime
+                            name, ext = os.path.splitext(base_filename)
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            filename = f"{name}_{timestamp}{ext}"
+
+                            download_result = download_media(media_id, filename)
+
+                            if "success" in download_result:
+                                media_buffer[sender_id] = {
+                                    "media_type": media_type,
+                                    "media_path": download_result["path"]
+                                }
+                                logging.info(f"📎 Saved {media_type}: {download_result['path']}")
+                            else:
+                                logging.error(f"❌ Failed to save {media_type}: {download_result}")
+
                         if not is_registered_user(sender_id):
                             logging.info(f"Blocked unregistered user: {sender_id}")
                             send_whatsapp_message(sender_id, "You are not registered. Please register first.")
                             continue
 
-                        # ✅ Prevent duplicate messages
                         if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
                             logging.info(f"⚠️ Skipping duplicate message {message_id}")
                             continue
 
-                        # ✅ Mark message as processed
                         mark_message_as_processed(message_id)
 
                         # ✅ Handle button replies
@@ -359,11 +425,9 @@ def process_webhook(data):
                             button_id = message["interactive"]["button_reply"]["id"]
 
                             if button_id == "create_ticket":
-                                # Step 1: Ask user to choose a category
                                 query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_category_prompt(sender_id)
                                 continue
-
                             elif button_id == "check_ticket":
                                 send_whatsapp_tickets(sender_id)
                                 continue
@@ -372,44 +436,56 @@ def process_webhook(data):
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         property = query_database("SELECT property FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property"]
                         assigned_admin = query_database("SELECT id FROM admin_users WHERE property = %s", (property,))[0]["id"]
+
                         if user_status and user_status[0]["last_action"] == "awaiting_category":
                             category_name = get_category_name(message_text)
-
                             if category_name:
-                                # Store selected category and ask for issue description
                                 query_database(
                                     "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
                                     (category_name, sender_id),
                                     commit=True,
                                 )
-                                send_whatsapp_message(sender_id, "Please describe your issue, and we will create a ticket for you.")
-                                del user_timers[sender_id]  # Remove timeout tracking
+                                send_whatsapp_message(sender_id, "Please describe your issue, or upload a supporting file.")
+                                del user_timers[sender_id]
                             else:
-                                send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, or 3️⃣.")
-                                send_category_prompt(sender_id)  # Reprompt if invalid input
+                                send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
+                                send_category_prompt(sender_id)
                             continue
 
-                        # ✅ Handle text-based ticket creation with category
+                        # ✅ Handle issue description + media
                         if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
                             user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
                             if user_info:
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
 
+                                # Use provided text or fallback to "No description"
+                                description = message_text if message_text else "No description provided"
+
                                 query_database(
                                     "INSERT INTO tickets (user_id, issue_description, status, created_at, category, property, assigned_admin) VALUES (%s, %s, 'Open', NOW(), %s, %s, %s)",
-                                    (user_id, message_text, category, property, assigned_admin),
+                                    (user_id, description, category, property, assigned_admin),
                                     commit=True,
                                 )
+
+                                # Get new ticket ID
+                                ticket_id = query_database("SELECT LAST_INSERT_ID() AS id")[0]["id"]
+
+                                # ✅ Attach media if any
+                                media = media_buffer.pop(sender_id, None)
+                                if media:
+                                    save_ticket_media(ticket_id, media["media_type"], media["media_path"])
+                                    logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
+
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
-                            continue  
+                            continue
 
-                        # ✅ Handle common messages
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
+
 
 
 if __name__ == "__main__":
