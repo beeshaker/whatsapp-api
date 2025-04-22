@@ -7,7 +7,7 @@ import logging
 import threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from conn1 import get_db_connection1, save_ticket_media
+from conn1 import get_db_connection1, save_ticket_media, insert_ticket_and_get_id
 from sqlalchemy.sql import text
 import threading
 from datetime import datetime
@@ -364,6 +364,9 @@ def download_media(media_id, filename=None):
     return {"success": True, "path": save_path}
 
 
+
+
+
 def process_webhook(data):
     """Handles incoming WhatsApp messages."""
     logging.info(f"Processing webhook data: {json.dumps(data, indent=2)}")
@@ -463,14 +466,7 @@ def process_webhook(data):
                                 # Use provided text or fallback to "No description"
                                 description = message_text if message_text else "No description provided"
 
-                                query_database(
-                                    "INSERT INTO tickets (user_id, issue_description, status, created_at, category, property, assigned_admin) VALUES (%s, %s, 'Open', NOW(), %s, %s, %s)",
-                                    (user_id, description, category, property, assigned_admin),
-                                    commit=True,
-                                )
-
-                                # Get new ticket ID
-                                ticket_id = query_database("SELECT LAST_INSERT_ID() AS id")[0]["id"]
+                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property, assigned_admin)
 
                                 # ✅ Attach media if any
                                 media = media_buffer.pop(sender_id, None)
