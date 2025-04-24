@@ -320,7 +320,7 @@ def send_template_message(to, template_name, parameters):
         "type": "template",
         "template": {
             "name": template_name,
-            "language": { "code": "en_US" },
+            "language": { "code": "en" },
             "components": [{
                 "type": "body",
                 "parameters": [{"type": "text", "text": p} for p in parameters]
