@@ -282,7 +282,7 @@ def external_send_message():
     data = request.get_json()
     api_key = request.headers.get("X-API-KEY")  # Optional security
 
-    if api_key != os.getenv("INTERNAL_API_KEY"):  # secure communication
+    if api_key != os.getenv("INTERNAL_API_KEY"):
         return jsonify({"error": "Unauthorized"}), 401
 
     to = data.get("to")
@@ -290,18 +290,21 @@ def external_send_message():
     template_name = data.get("template_name")
     template_parameters = data.get("template_parameters", [])
 
-    if not to or not message:
+    if not to or (not message and not template_name):
         return jsonify({"error": "Missing required fields"}), 400
-    
-    if template_name:
-            result = send_template_message(to, template_name, template_parameters)
-    elif message:
-        result = send_whatsapp_message(to, message)
-    else:
-        return jsonify({"error": "Either message or template_name must be provided"}), 400
 
-    result = send_whatsapp_message(to, message)
-    return jsonify(result), 200
+    try:
+        if template_name:
+            result = send_template_message(to, template_name, template_parameters)
+        else:
+            result = send_whatsapp_message(to, message)
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        print("❌ Error sending WhatsApp message:", e)
+        return jsonify({"error": str(e)}), 500
+
 
 
 def send_template_message(to, template_name, parameters):
