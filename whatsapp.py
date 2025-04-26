@@ -172,13 +172,7 @@ def get_category_name(category_number):
 
 
 # Prevent duplicate message processing
-def is_message_processed(message_id):
-    """Check if a message ID has already been processed."""
-    if message_id in processed_message_ids:
-        return True
-    query = "SELECT id FROM processed_messages WHERE id = %s"
-    result = query_database(query, (message_id,))
-    return bool(result)
+
 
 def mark_message_as_processed(message_id):
     """Mark a message as processed (in-memory & database)."""
