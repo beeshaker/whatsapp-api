@@ -430,7 +430,7 @@ def process_webhook(data):
                             send_whatsapp_message(sender_id, "You are not registered. Please register first.")
                             continue
 
-                        if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
+                        if is_message_processed(message_id, timestamp) or not should_process_message(sender_id, message_text):
                             logging.info(f"⚠️ Skipping duplicate message {message_id}")
                             continue
 
