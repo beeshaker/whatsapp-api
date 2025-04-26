@@ -423,9 +423,9 @@ def process_webhook(data):
                             timestamp = datetime.utcfromtimestamp(int(timestamp)).isoformat() + 'Z'
 
                         # ✅ Prevent duplicates
-                        if is_message_processed(message_id, timestamp):
-                            logging.info(f"⏭️ Skipping duplicate message ID: {message_id}")
-                            return
+                        #if is_message_processed(message_id, timestamp):
+                        #    logging.info(f"⏭️ Skipping duplicate message ID: {message_id}")
+                        #    return
 
                         # ✅ Handle text/media message extraction
                         if "text" in message:
