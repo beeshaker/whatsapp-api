@@ -40,43 +40,7 @@ user_timers = {}
 media_buffer = {}  # global store for media before ticket creation
 
 
-processed_message_ids = {}  # { message_id: timestamp }
 
-def is_message_processed(message_id, timestamp_iso):
-    # Convert timestamp from Meta format
-    now = datetime.now(datetime.timezone.utc)  # <-- 🛠️ This makes it timezone-aware
-    msg_time = datetime.fromtimestamp(timestamp_iso, tz=datetime.timezone.utc)
-
-    age = (now - msg_time).total_seconds()
-
-    # Ignore if it's older than 5 minutes (already processed before)
-    if age > 300:
-        logging.info(f"⏳ Skipping old message (>{age:.1f}s): {message_id}")
-        return True
-
-    # Already seen in memory?
-    if message_id in processed_message_ids:
-        logging.info(f"⚠️ Message ID {message_id} seen in memory")
-        return True
-
-    # Check DB to avoid race conditions or restarts
-    query = "SELECT id FROM processed_messages WHERE id = %s"
-    result = query_database(query, (message_id,))
-    if result:
-        processed_message_ids[message_id] = msg_time
-        logging.info(f"⚠️ Message ID {message_id} found in DB")
-        return True
-
-    return False
-
-
-def mark_message_as_processed(message_id, timestamp_iso):
-    msg_time = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
-    processed_message_ids[message_id] = msg_time
-    query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
-    query_database(query, (message_id,), commit=True)
-    
-    
 def opt_in_user(whatsapp_number):
     """Adds the recipient number to the WhatsApp allowed list."""
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -173,9 +137,19 @@ def get_category_name(category_number):
 
 
 # Prevent duplicate message processing
+def is_message_processed(message_id):
+    """Check if a message ID has already been processed."""
+    if message_id in processed_message_ids:
+        return True
+    query = "SELECT id FROM processed_messages WHERE id = %s"
+    result = query_database(query, (message_id,))
+    return bool(result)
 
-
-
+def mark_message_as_processed(message_id):
+    """Mark a message as processed (in-memory & database)."""
+    processed_message_ids.add(message_id)  # ✅ Immediate in-memory tracking
+    query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
+    query_database(query, (message_id,), commit=True)
 
 def should_process_message(sender_id, message_text):
     """Check if the last message was identical within 3 seconds."""
@@ -397,9 +371,8 @@ def download_media(media_id, filename=None):
 
 
 def process_webhook(data):
-    """Handles incoming WhatsApp messages, avoiding duplicates and retries."""
+    """Handles incoming WhatsApp messages."""
     logging.info(f"Processing webhook data: {json.dumps(data, indent=2)}")
-
     if "entry" in data:
         for entry in data["entry"]:
             for change in entry.get("changes", []):
@@ -411,28 +384,18 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id = message.get("id")
                         sender_id = message["from"]
-                        message_text = ""
-                        timestamp = message.get("timestamp")
-
-                        # Convert timestamp to ISO
-                        if timestamp and not timestamp.endswith("Z"):
-                            timestamp = datetime.utcfromtimestamp(int(timestamp)).isoformat() + 'Z'
-
-                        # ✅ Prevent duplicates
-                        if is_message_processed(message_id, timestamp):
-                            logging.info(f"⏭️ Skipping duplicate message ID: {message_id}")
-                            return
-
-                        # ✅ Handle text/media message extraction
+                        message_text =""
                         if "text" in message:
                             message_text = message.get("text", {}).get("body", "").strip()
                         elif message.get("type") in ["image", "video", "document"]:
                             message_text = message[message["type"]].get("caption", "").strip()
 
-                        # ✅ Handle media attachments
+                        # ✅ Handle media uploads (document, image, video)
                         media_type = message.get("type")
                         if media_type in ["document", "image", "video"]:
                             media_id = message[media_type]["id"]
+                            
+                            # Build base filename
                             if media_type == "document":
                                 base_filename = message[media_type].get("filename", f"{media_id}.pdf")
                             elif media_type == "image":
@@ -440,11 +403,14 @@ def process_webhook(data):
                             elif media_type == "video":
                                 base_filename = f"{media_id}.mp4"
 
-                            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            # Add timestamp to filename
+                            
                             name, ext = os.path.splitext(base_filename)
-                            filename = f"{name}_{timestamp_str}{ext}"
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            filename = f"{name}_{timestamp}{ext}"
 
                             download_result = download_media(media_id, filename)
+
                             if "success" in download_result:
                                 media_buffer[sender_id] = {
                                     "media_type": media_type,
@@ -457,26 +423,25 @@ def process_webhook(data):
                         if not is_registered_user(sender_id):
                             logging.info(f"Blocked unregistered user: {sender_id}")
                             send_whatsapp_message(sender_id, "You are not registered. Please register first.")
-                            return
+                            continue
 
-                        if not should_process_message(sender_id, message_text):
-                            logging.info(f"⏭️ Skipping message {message_id} due to similarity throttling.")
-                            return
+                        if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
+                            logging.info(f"⚠️ Skipping duplicate message {message_id}")
+                            continue
 
-                        mark_message_as_processed(message_id, timestamp)
+                        mark_message_as_processed(message_id)
 
-                        # ✅ Handle interactive button responses
+                        # ✅ Handle button replies
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             button_id = message["interactive"]["button_reply"]["id"]
 
                             if button_id == "create_ticket":
                                 query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_category_prompt(sender_id)
-                                return
-
+                                continue
                             elif button_id == "check_ticket":
                                 send_whatsapp_tickets(sender_id)
-                                return
+                                continue
 
                         # ✅ Handle category selection
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
@@ -496,18 +461,21 @@ def process_webhook(data):
                             else:
                                 send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
                                 send_category_prompt(sender_id)
-                            return
+                            continue
 
-                        # ✅ Handle ticket creation
+                        # ✅ Handle issue description + media
                         if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
                             user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
                             if user_info:
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
+
+                                # Use provided text or fallback to "No description"
                                 description = message_text if message_text else "No description provided"
 
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property, assigned_admin)
 
+                                # ✅ Attach media if any
                                 media = media_buffer.pop(sender_id, None)
                                 if media:
                                     save_ticket_media(ticket_id, media["media_type"], media["media_path"])
@@ -519,12 +487,10 @@ def process_webhook(data):
                                     del user_timers[sender_id]
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
-                            return
+                            continue
 
-                        # ✅ Default trigger
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
-                            return
 
 
 
