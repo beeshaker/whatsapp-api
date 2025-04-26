@@ -137,19 +137,24 @@ def get_category_name(category_number):
 
 
 # Prevent duplicate message processing
-def is_message_processed(message_id):
-    """Check if a message ID has already been processed."""
+def is_message_processed(message_id, timestamp_iso):
+    msg_time = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+    now = datetime.utcnow()
+    age = (now - msg_time).total_seconds()
+    if age > 300:
+        return True
     if message_id in processed_message_ids:
         return True
-    query = "SELECT id FROM processed_messages WHERE id = %s"
-    result = query_database(query, (message_id,))
-    return bool(result)
+    result = query_database("SELECT id FROM processed_messages WHERE id = %s", (message_id,))
+    if result:
+        processed_message_ids[message_id] = msg_time
+        return True
+    return False
 
-def mark_message_as_processed(message_id):
-    """Mark a message as processed (in-memory & database)."""
-    processed_message_ids.add(message_id)  # ✅ Immediate in-memory tracking
-    query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
-    query_database(query, (message_id,), commit=True)
+def mark_message_as_processed(message_id, timestamp_iso):
+    msg_time = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+    processed_message_ids[message_id] = msg_time
+    query_database("INSERT IGNORE INTO processed_messages (id) VALUES (%s)", (message_id,), commit=True)
 
 def should_process_message(sender_id, message_text):
     """Check if the last message was identical within 3 seconds."""
