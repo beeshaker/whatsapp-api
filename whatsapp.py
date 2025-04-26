@@ -44,8 +44,9 @@ processed_message_ids = {}  # { message_id: timestamp }
 
 def is_message_processed(message_id, timestamp_iso):
     # Convert timestamp from Meta format
-    msg_time = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
-    now = datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)  # <-- 🛠️ This makes it timezone-aware
+    msg_time = datetime.datetime.fromtimestamp(timestamp_iso, tz=datetime.timezone.utc)
+
     age = (now - msg_time).total_seconds()
 
     # Ignore if it's older than 5 minutes (already processed before)
