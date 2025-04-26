@@ -434,7 +434,7 @@ def process_webhook(data):
                             logging.info(f"⚠️ Skipping duplicate message {message_id}")
                             continue
 
-                        mark_message_as_processed(message_id)
+                        mark_message_as_processed(message_id, timestamp)
 
                         # ✅ Handle button replies
                         if "interactive" in message and "button_reply" in message["interactive"]:
