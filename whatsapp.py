@@ -429,7 +429,7 @@ def process_webhook(data):
                             logging.info(f"Blocked unregistered user: {sender_id}")
                             send_whatsapp_message(sender_id, "You are not registered. Please register first.")
                             continue
-
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         if is_message_processed(message_id, timestamp) or not should_process_message(sender_id, message_text):
                             logging.info(f"⚠️ Skipping duplicate message {message_id}")
                             continue
