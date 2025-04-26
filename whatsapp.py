@@ -175,11 +175,7 @@ def get_category_name(category_number):
 # Prevent duplicate message processing
 
 
-def mark_message_as_processed(message_id):
-    """Mark a message as processed (in-memory & database)."""
-    processed_message_ids.add(message_id)  # ✅ Immediate in-memory tracking
-    query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
-    query_database(query, (message_id,), commit=True)
+
 
 def should_process_message(sender_id, message_text):
     """Check if the last message was identical within 3 seconds."""
