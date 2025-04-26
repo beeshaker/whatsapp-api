@@ -44,7 +44,7 @@ processed_message_ids = {}  # { message_id: timestamp }
 
 def is_message_processed(message_id, timestamp_iso):
     # Convert timestamp from Meta format
-    now = datetime.now(datetime.timezone.utc)  # <-- 🛠️ This makes it timezone-aware
+    now = datetime.datetime.now(datetime.timezone.utc)  # <-- 🛠️ This makes it timezone-aware
     msg_time = datetime.datetime.fromtimestamp(timestamp_iso, tz=datetime.timezone.utc)
 
     age = (now - msg_time).total_seconds()
@@ -423,9 +423,9 @@ def process_webhook(data):
                             timestamp = datetime.utcfromtimestamp(int(timestamp)).isoformat() + 'Z'
 
                         # ✅ Prevent duplicates
-                        #if is_message_processed(message_id, timestamp):
-                        #    logging.info(f"⏭️ Skipping duplicate message ID: {message_id}")
-                        #    return
+                        if is_message_processed(message_id, timestamp):
+                            logging.info(f"⏭️ Skipping duplicate message ID: {message_id}")
+                            return
 
                         # ✅ Handle text/media message extraction
                         if "text" in message:
