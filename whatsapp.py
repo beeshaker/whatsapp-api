@@ -430,6 +430,9 @@ def process_webhook(data):
                             continue
 
                         mark_message_as_processed(message_id)
+                        
+                        if message_text.lower() in ["hi", "hello", "help", "menu"]:
+                            send_whatsapp_buttons(sender_id)
 
                         # ✅ Handle button replies
                         if "interactive" in message and "button_reply" in message["interactive"]:
@@ -489,8 +492,7 @@ def process_webhook(data):
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
                             continue
 
-                        if message_text.lower() in ["hi", "hello", "help", "menu"]:
-                            send_whatsapp_buttons(sender_id)
+                        
 
 
 
