@@ -41,14 +41,28 @@ media_buffer = {}  # global store for media before ticket creation
 
 
 
-def opt_in_user(whatsapp_number):
-    """Adds the recipient number to the WhatsApp allowed list."""
-    url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+from flask import Flask, request, jsonify
+import os
+import requests
+
+app = Flask(__name__)
+
+@app.route('/opt_in_user', methods=['POST'])
+def opt_in_user_route():
+    if request.headers.get("X-API-KEY") != os.getenv("INTERNAL_API_KEY"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    whatsapp_number = data.get("whatsapp_number")
+    
+    if not whatsapp_number:
+        return jsonify({"error": "Missing whatsapp_number"}), 400
+
+    url = f"https://graph.facebook.com/v22.0/{os.getenv('WHATSAPP_PHONE_NUMBER_ID')}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {os.getenv('WHATSAPP_ACCESS_TOKEN')}",
         "Content-Type": "application/json",
     }
-    
     payload = {
         "messaging_product": "whatsapp",
         "to": whatsapp_number,
@@ -67,16 +81,12 @@ def opt_in_user(whatsapp_number):
         }
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    print("Status code ", response.status_code)
-    print(WHATSAPP_PHONE_NUMBER_ID)
-    
-    if response.status_code == 200:
-        print("worked")
-        return True, "User opted in successfully!"
-    else:
-        print(f"Error: {response.json()}")
-        return False, f"Error: {response.json()}"
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        return jsonify({"status": "success", "details": response.json()}), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 # Function to connect to MySQL and execute queries
 def query_database(query, params=(), commit=False):
@@ -449,7 +459,7 @@ def process_webhook(data):
                         # ✅ Handle category selection
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         property = query_database("SELECT property FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property"]
-                        assigned_admin = query_database("SELECT id FROM admin_users WHERE property = %s", (property,))[0]["id"]
+                        #assigned_admin = query_database("SELECT id FROM admin_users WHERE property_id = %s", (property,))[0]["id"]
 
                         if user_status and user_status[0]["last_action"] == "awaiting_category":
                             category_name = get_category_name(message_text)
@@ -476,7 +486,7 @@ def process_webhook(data):
                                 # Use provided text or fallback to "No description"
                                 description = message_text if message_text else "No description provided"
 
-                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property, assigned_admin)
+                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property, "admin")
 
                                 # ✅ Attach media if any
                                 media = media_buffer.pop(sender_id, None)
