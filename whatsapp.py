@@ -458,7 +458,7 @@ def process_webhook(data):
 
                         # ✅ Handle category selection
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
-                        property = query_database("SELECT property FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property"]
+                        property = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property_id"]
                         #assigned_admin = query_database("SELECT id FROM admin_users WHERE property_id = %s", (property,))[0]["id"]
 
                         if user_status and user_status[0]["last_action"] == "awaiting_category":

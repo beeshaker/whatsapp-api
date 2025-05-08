@@ -42,7 +42,7 @@ def insert_ticket_and_get_id(user_id, description, category, property, assigned_
     engine = get_db_connection1()
     insert_query = text("""
         INSERT INTO tickets 
-        (user_id, issue_description, status, created_at, category, property, assigned_admin)
+        (user_id, issue_description, status, created_at, category, property_id, assigned_admin)
         VALUES (:user_id, :description, 'Open', NOW(), :category, :property, :assigned_admin)
     """)
     select_query = text("SELECT LAST_INSERT_ID() AS id")
