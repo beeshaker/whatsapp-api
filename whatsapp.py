@@ -405,6 +405,20 @@ def purge_expired_media(ttl_seconds=300):
 
     for wa_id in expired_keys:
         del media_buffer[wa_id]
+        
+        
+def flush_user_media_after_ticket(sender_id, ticket_id, delay=30):
+    """Flushes any media uploaded shortly after ticket creation."""
+    time.sleep(delay)
+
+    media_list = media_buffer.pop(sender_id, [])
+    for entry in media_list:
+        media = entry["media"]
+        save_ticket_media(ticket_id, media["media_type"], media["media_path"])
+        logging.info(f"📁 (Post-ticket) Linked {media['media_type']} to ticket #{ticket_id}")
+        
+        
+
 
 
 
@@ -527,11 +541,14 @@ def process_webhook(data):
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
                                 # ✅ Attach media if any
-                                media_list = media_buffer.pop(sender_id, [])
+                                media_list = media_buffer.get(sender_id, [])
                                 for entry in media_list:
                                     media = entry["media"]
                                     save_ticket_media(ticket_id, media["media_type"], media["media_path"])
                                     logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
+                                    
+                                threading.Thread(target=flush_user_media_after_ticket, args=(sender_id, ticket_id)).start()
+
 
 
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
