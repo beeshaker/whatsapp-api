@@ -513,16 +513,23 @@ def process_webhook(data):
                         property = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property_id"]
                         #assigned_admin = query_database("SELECT id FROM admin_users WHERE property_id = %s", (property,))[0]["id"]
 
-                        if user_status and user_status[0]["last_action"] == "awaiting_category":
-                            category_name = get_category_name(message_text)
-                            if category_name:
-                                query_database(
-                                    "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
-                                    (category_name, sender_id),
-                                    commit=True,
-                                )
-                                send_whatsapp_message(sender_id, "Please describe your issue, or upload a supporting file.")
-                                del user_timers[sender_id]
+                        if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
+                            user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+                            if user_info:
+                                user_id = user_info[0]["id"]
+                                category = user_info[0]["temp_category"]
+
+                                description = message_text if message_text else "No description provided"
+                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
+
+                                # ✅ Schedule media linking in the background
+                                threading.Thread(target=flush_user_media_after_ticket, args=(sender_id, ticket_id)).start()
+
+                                query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
+                                send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
+                                if sender_id in user_timers:
+                                    del user_timers[sender_id]
+
                             else:
                                 send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
                                 send_category_prompt(sender_id)
