@@ -391,12 +391,28 @@ def download_media(media_id, filename=None):
 
     return {"success": True, "path": save_path}
 
+def purge_expired_media(ttl_seconds=300):
+    """Removes media entries older than TTL (in seconds)."""
+    now = time.time()
+    expired_keys = []
+
+    for wa_id, media_list in media_buffer.items():
+        fresh_media = [entry for entry in media_list if now - entry["timestamp"] < ttl_seconds]
+        if fresh_media:
+            media_buffer[wa_id] = fresh_media
+        else:
+            expired_keys.append(wa_id)
+
+    for wa_id in expired_keys:
+        del media_buffer[wa_id]
 
 
 
 
 def process_webhook(data):
     """Handles incoming WhatsApp messages."""
+    purge_expired_media()
+
     logging.info(f"Processing webhook data: {json.dumps(data, indent=2)}")
     if "entry" in data:
         for entry in data["entry"]:
@@ -437,10 +453,17 @@ def process_webhook(data):
                             download_result = download_media(media_id, filename)
 
                             if "success" in download_result:
-                                media_buffer[sender_id] = {
-                                    "media_type": media_type,
-                                    "media_path": download_result["path"]
-                                }
+                                if sender_id not in media_buffer:
+                                    media_buffer[sender_id] = []
+
+                                # Append new media with timestamp
+                                media_buffer[sender_id].append({
+                                    "media": {
+                                        "media_type": media_type,
+                                        "media_path": download_result["path"]
+                                    },
+                                    "timestamp": time.time()
+                                })
                                 logging.info(f"📎 Saved {media_type}: {download_result['path']}")
                             else:
                                 logging.error(f"❌ Failed to save {media_type}: {download_result}")
@@ -501,13 +524,15 @@ def process_webhook(data):
                                 # Use provided text or fallback to "No description"
                                 description = message_text if message_text else "No description provided"
 
-                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property, "admin")
+                                ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
                                 # ✅ Attach media if any
-                                media = media_buffer.pop(sender_id, None)
-                                if media:
+                                media_list = media_buffer.pop(sender_id, [])
+                                for entry in media_list:
+                                    media = entry["media"]
                                     save_ticket_media(ticket_id, media["media_type"], media["media_path"])
                                     logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
+
 
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
