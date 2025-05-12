@@ -542,28 +542,28 @@ def process_webhook(data):
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
 
-                                # Use provided text or fallback to "No description"
-                                description = message_text if message_text else "No description provided"
+                                # ✅ Require a proper description (not just a blank message or captionless media)
+                                if not message_text:
+                                    send_whatsapp_message(sender_id, "✏️ Please describe your issue before we create the ticket.")
+                                    return
 
+                                description = message_text.strip()
+
+                                # ✅ Create the ticket
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
-                                # ✅ Attach media if any
-                                media_list = media_buffer.get(sender_id, [])
-                                for entry in media_list:
-                                    media = entry["media"]
-                                    save_ticket_media(ticket_id, media["media_type"], media["media_path"])
-                                    logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
-                                    
+                                # ✅ Schedule background task to flush media (allowing uploads up to 30s later)
                                 threading.Thread(target=flush_user_media_after_ticket, args=(sender_id, ticket_id)).start()
 
-
-
+                                # ✅ Clear user state so no new tickets are created from more media
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
+                                
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
                                 if sender_id in user_timers:
                                     del user_timers[sender_id]
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
+
                             continue
 
                         
