@@ -439,27 +439,18 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id = message.get("id")
                         sender_id = message["from"]
-                        message_text =""
+                        message_text = ""
+
                         if "text" in message:
                             message_text = message.get("text", {}).get("body", "").strip()
                         elif message.get("type") in ["image", "video", "document"]:
                             message_text = message[message["type"]].get("caption", "").strip()
 
-                        # ✅ Handle media uploads (document, image, video)
+                        # ✅ Handle media uploads
                         media_type = message.get("type")
                         if media_type in ["document", "image", "video"]:
                             media_id = message[media_type]["id"]
-                            
-                            # Build base filename
-                            if media_type == "document":
-                                base_filename = message[media_type].get("filename", f"{media_id}.pdf")
-                            elif media_type == "image":
-                                base_filename = f"{media_id}.jpg"
-                            elif media_type == "video":
-                                base_filename = f"{media_id}.mp4"
-
-                            # Add timestamp to filename
-                            
+                            base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
                             name, ext = os.path.splitext(base_filename)
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             filename = f"{name}_{timestamp}{ext}"
@@ -469,8 +460,6 @@ def process_webhook(data):
                             if "success" in download_result:
                                 if sender_id not in media_buffer:
                                     media_buffer[sender_id] = []
-
-                                # Append new media with timestamp
                                 media_buffer[sender_id].append({
                                     "media": {
                                         "media_type": media_type,
@@ -482,24 +471,27 @@ def process_webhook(data):
                             else:
                                 logging.error(f"❌ Failed to save {media_type}: {download_result}")
 
+                        # 🛑 Ignore unregistered users
                         if not is_registered_user(sender_id):
                             logging.info(f"Blocked unregistered user: {sender_id}")
                             send_whatsapp_message(sender_id, "You are not registered. Please register first.")
                             continue
 
+                        # 🛑 Skip duplicate/rapid messages
                         if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
                             logging.info(f"⚠️ Skipping duplicate message {message_id}")
                             continue
 
                         mark_message_as_processed(message_id)
-                        
+
+                        # ✅ Basic menu prompt
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
+                            continue
 
-                        # ✅ Handle button replies
+                        # ✅ Handle button reply
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             button_id = message["interactive"]["button_reply"]["id"]
-
                             if button_id == "create_ticket":
                                 query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_category_prompt(sender_id)
@@ -508,43 +500,52 @@ def process_webhook(data):
                                 send_whatsapp_tickets(sender_id)
                                 continue
 
-                        # ✅ Handle category selection
+                        # ✅ Status + property fetch
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         property = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property_id"]
-                        #assigned_admin = query_database("SELECT id FROM admin_users WHERE property_id = %s", (property,))[0]["id"]
 
-                        
+                        # ✅ Handle category selection
+                        if user_status and user_status[0]["last_action"] == "awaiting_category":
+                            category_name = get_category_name(message_text)
+                            if category_name:
+                                query_database(
+                                    "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
+                                    (category_name, sender_id),
+                                    commit=True
+                                )
+                                send_whatsapp_message(sender_id, "Please describe your issue, or upload a supporting file.")
+                                if sender_id in user_timers:
+                                    del user_timers[sender_id]
+                            else:
+                                send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
+                                send_category_prompt(sender_id)
+                            continue
 
-                        # ✅ Handle issue description + media
+                        # ✅ Handle issue description + ticket creation
                         if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
                             user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
                             if user_info:
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
 
-                                # ✅ Require a proper description (not just a blank message or captionless media)
                                 if not message_text:
                                     send_whatsapp_message(sender_id, "✏️ Please describe your issue before we create the ticket.")
-                                    return
+                                    continue
 
                                 description = message_text.strip()
-
-                                # ✅ Create the ticket
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
-                                # ✅ Schedule background task to flush media (allowing uploads up to 30s later)
+                                # ✅ Schedule background task for late media
                                 threading.Thread(target=flush_user_media_after_ticket, args=(sender_id, ticket_id)).start()
 
-                                # ✅ Clear user state so no new tickets are created from more media
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
-                                
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
                                 if sender_id in user_timers:
                                     del user_timers[sender_id]
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
-
                             continue
+
 
                         
 
