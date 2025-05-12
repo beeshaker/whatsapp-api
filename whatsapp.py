@@ -179,12 +179,27 @@ def should_process_message(sender_id, message_text):
     return True
 
 def is_registered_user(whatsapp_number):
-        """Checks if the WhatsApp number is registered in the database."""
-        engine = get_db_connection1()
-        with engine.connect() as conn:
-            query = text("SELECT id FROM users WHERE whatsapp_number = :whatsapp_number")
-            result = conn.execute(query, {"whatsapp_number": whatsapp_number}).fetchone()
-        return result is not None
+    """Checks if the WhatsApp number is registered as a user or admin."""
+    engine = get_db_connection1()
+    with engine.connect() as conn:
+        user_check = conn.execute(
+            text("SELECT id FROM users WHERE whatsapp_number = :whatsapp_number"),
+            {"whatsapp_number": whatsapp_number}
+        ).fetchone()
+
+        admin_check = conn.execute(
+            text("SELECT id FROM admin_users WHERE whatsapp_number = :whatsapp_number"),
+            {"whatsapp_number": whatsapp_number}
+        ).fetchone()
+
+    return user_check is not None or admin_check is not None
+    
+    
+def is_registered_user(whatsapp_number):
+    """Check if number exists in users or admin_users."""
+    user_check = query_database("SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,))
+    admin_check = query_database("SELECT id FROM admin_users WHERE whatsapp_number = %s", (whatsapp_number,))
+    return bool(user_check or admin_check)
 
 
 def send_whatsapp_buttons(to):

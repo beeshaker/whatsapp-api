@@ -37,7 +37,7 @@ def save_ticket_media(ticket_id, media_type, file_path):
 
         
         
-def insert_ticket_and_get_id(user_id, description, category, property, assigned_admin):
+def insert_ticket_and_get_id(user_id, description, category, property):
     """Inserts a new ticket and returns the auto-incremented ticket ID."""
     engine = get_db_connection1()
     insert_query = text("""
@@ -53,7 +53,7 @@ def insert_ticket_and_get_id(user_id, description, category, property, assigned_
             "description": description,
             "category": category,
             "property": property,
-            "assigned_admin": assigned_admin
+            "assigned_admin": 6
         })
         result = conn.execute(select_query).fetchone()
         conn.commit()
