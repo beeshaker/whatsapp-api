@@ -536,7 +536,12 @@ def process_webhook(data):
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
                                 # ✅ Schedule background task for late media
-                                threading.Thread(target=flush_user_media_after_ticket, args=(sender_id, ticket_id)).start()
+                                media_list = media_buffer.pop(sender_id, [])
+                                for entry in media_list:
+                                    media = entry["media"]
+                                    save_ticket_media(ticket_id, media["media_type"], media["media_path"])
+                                    logging.info(f"📁 (Immediate flush) Linked {media['media_type']} to ticket #{ticket_id}")
+
 
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
