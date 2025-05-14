@@ -426,8 +426,8 @@ def flush_user_media_after_ticket(sender_id, ticket_id, delay=30):
 def process_webhook(data):
     """Handles incoming WhatsApp messages."""
     purge_expired_media()
-
     logging.info(f"Processing webhook data: {json.dumps(data, indent=2)}")
+
     if "entry" in data:
         for entry in data["entry"]:
             for change in entry.get("changes", []):
@@ -450,7 +450,7 @@ def process_webhook(data):
                         media_type = message.get("type")
                         if media_type in ["document", "image", "video"]:
                             media_id = message[media_type]["id"]
-                            base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
+                            base_filename = message[message_type].get("filename", f"{media_id}.{media_type[:3]}")
                             name, ext = os.path.splitext(base_filename)
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             filename = f"{name}_{timestamp}{ext}"
@@ -528,19 +528,20 @@ def process_webhook(data):
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
 
+                                # ✅ Avoid creating ticket from caption-only media
                                 if not message_text:
                                     send_whatsapp_message(sender_id, "✏️ Please describe your issue before we create the ticket. You can include attachments if needed.")
                                     continue
 
+                                # ✅ Create ticket and flush media
                                 description = message_text.strip()
                                 ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
-                                # ✅ Immediately flush media to ticket
                                 media_list = media_buffer.pop(sender_id, [])
                                 for entry in media_list:
                                     media = entry["media"]
                                     save_ticket_media(ticket_id, media["media_type"], media["media_path"])
-                                    logging.info(f"📁 (Immediate flush) Linked {media['media_type']} to ticket #{ticket_id}")
+                                    logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
 
                                 query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
@@ -549,10 +550,3 @@ def process_webhook(data):
                             else:
                                 send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
                             continue
-
-                        
-
-
-
-if __name__ == "__main__":
-    app.run(port=5000, debug=False)  # ⚠️ Disabled debug mode to prevent duplicate processing
