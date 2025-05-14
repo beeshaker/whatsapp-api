@@ -450,7 +450,7 @@ def process_webhook(data):
                         media_type = message.get("type")
                         if media_type in ["document", "image", "video"]:
                             media_id = message[media_type]["id"]
-                            base_filename = message[message_type].get("filename", f"{media_id}.{media_type[:3]}")
+                            base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
                             name, ext = os.path.splitext(base_filename)
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             filename = f"{name}_{timestamp}{ext}"
