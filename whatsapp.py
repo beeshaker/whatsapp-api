@@ -421,8 +421,6 @@ def flush_user_media_after_ticket(sender_id, ticket_id, delay=30):
 
 
 
-
-
 def process_webhook(data):
     """Handles incoming WhatsApp messages."""
     purge_expired_media()
@@ -463,11 +461,23 @@ def process_webhook(data):
                                 media_buffer[sender_id].append({
                                     "media": {
                                         "media_type": media_type,
-                                        "media_path": download_result["path"]
+                                        "media_path": download_result["path"],
+                                        "caption": message_text.strip() if message_text else None  # Save caption if exists
                                     },
                                     "timestamp": time.time()
                                 })
                                 logging.info(f"📎 Saved {media_type}: {download_result['path']}")
+
+                                # ————— NEW PROMPT LOGIC —————
+                                media_count = len(media_buffer[sender_id])
+                                non_empty_captions = [entry["media"].get("caption") for entry in media_buffer[sender_id] if entry["media"].get("caption")]
+
+                                if non_empty_captions:
+                                    combined_caption = "\n\n".join([f"📎 Caption {i+1}:\n{cap}" for i, cap in enumerate(non_empty_captions)])
+                                    send_whatsapp_message(sender_id, f"📝 I've collected the following captions:\n\n{combined_caption}\n\nPlease confirm or describe your issue.")
+                                else:
+                                    send_whatsapp_message(sender_id, f"📎 You've sent {media_count} media file(s). Please describe your issue.")
+
                             else:
                                 logging.error(f"❌ Failed to save {media_type}: {download_result}")
 
@@ -528,9 +538,29 @@ def process_webhook(data):
                                 user_id = user_info[0]["id"]
                                 category = user_info[0]["temp_category"]
 
-                                # ✅ Avoid creating ticket from caption-only media
+                                # ✅ Prevent duplicate ticket creation within 60 seconds
+                                ticket_check = query_database("""
+                                    SELECT created_at FROM tickets
+                                    WHERE user_id = %s
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                """, (user_id,))
+
+                                if ticket_check:
+                                    last_created = ticket_check[0]["created_at"]
+                                    if (datetime.now() - last_created).total_seconds() < 60:
+                                        logging.info(f"🛑 Ticket already created recently for user {sender_id}. Skipping.")
+                                        continue
+
+                                # ✅ Auto-fill description from captions if no text was sent
+                                if not message_text and sender_id in media_buffer:
+                                    captions = [entry["media"].get("caption") for entry in media_buffer[sender_id]]
+                                    captions = [c for c in captions if c]
+                                    if captions:
+                                        message_text = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
+
                                 if not message_text:
-                                    send_whatsapp_message(sender_id, "✏️ Please describe your issue before we create the ticket. You can include attachments if needed.")
+                                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or confirm the above captions.")
                                     continue
 
                                 # ✅ Create ticket and flush media
