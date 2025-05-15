@@ -541,11 +541,24 @@ def handle_button_reply(message, sender_id):
         send_whatsapp_tickets(sender_id)
 
     elif button_id == "upload_done":
-        query_database(
-            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
-            (sender_id,), commit=True
-        )
-        send_category_prompt(sender_id)
+        # Check if a category is already selected
+        user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+        
+        if user_data and user_data[0]["temp_category"]:
+            # Skip category prompt — go directly to issue description
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+                (sender_id,), commit=True
+            )
+            send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
+        else:
+            # No category selected yet — go to category prompt
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+                (sender_id,), commit=True
+            )
+            send_category_prompt(sender_id)
+
 
     elif button_id == "upload_not_done":
         send_whatsapp_message(sender_id, "👍 Okay, send the remaining file(s) when you're ready.")
