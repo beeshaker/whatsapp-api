@@ -513,18 +513,10 @@ def handle_media_upload(message, sender_id, message_text):
             })
             logging.info(f"📎 Saved {media_type}: {download_result['path']}")
 
-            # Prompt confirmation or description
+            # Prompt: Are you done uploading?
             media_count = len(media_buffer[sender_id])
-            non_empty_captions = [
-                entry["media"].get("caption")
-                for entry in media_buffer[sender_id]
-                if entry["media"].get("caption")
-            ]
-            if non_empty_captions:
-                send_caption_confirmation(sender_id, non_empty_captions, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID)
-                start_fallback_timer(sender_id)
-            else:
-                send_whatsapp_message(sender_id, f"📎 You've sent {media_count} media file(s). Please describe your issue.")
+            send_done_upload_prompt(sender_id, media_count)
+            start_fallback_timer(sender_id)
 
         else:
             logging.error(f"❌ Failed to save {media_type}: {download_result}")
@@ -532,9 +524,11 @@ def handle_media_upload(message, sender_id, message_text):
         return True
     return False
 
+
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
 
+    # Cancel any fallback timeout
     if sender_id in pending_confirmations:
         pending_confirmations[sender_id].cancel()
         del pending_confirmations[sender_id]
@@ -546,11 +540,61 @@ def handle_button_reply(message, sender_id):
     elif button_id == "check_ticket":
         send_whatsapp_tickets(sender_id)
 
-    elif button_id == "caption_confirm_yes":
-        handle_auto_submit_ticket(sender_id)
+    elif button_id == "upload_done":
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+            (sender_id,), commit=True
+        )
+        send_category_prompt(sender_id)
 
-    elif button_id == "caption_confirm_no":
-        send_whatsapp_message(sender_id, "❌ Okay, please describe your issue in a message.")
+    elif button_id == "upload_not_done":
+        send_whatsapp_message(sender_id, "👍 Okay, send the remaining file(s) when you're ready.")
+        
+        
+        
+def send_done_upload_prompt(phone_number, media_count):
+    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    body_text = f"📎 You've sent *{media_count}* file(s).\nAre you done uploading attachments?"
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone_number,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": body_text
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "upload_done",
+                            "title": "✅ Yes – Submit"
+                        }
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "upload_not_done",
+                            "title": "❌ No – More to Add"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
+
+
         
         
 def handle_auto_submit_ticket(sender_id):
@@ -597,7 +641,17 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
             return
 
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
-    media_list = media_buffer.pop(sender_id, [])
+    media_list = media_buffer.get(sender_id, [])
+
+    for entry in media_list:
+        media = entry["media"]
+        save_ticket_media(ticket_id, media["media_type"], media["media_path"])
+        logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
+
+    # Clear buffer AFTER saving
+    if sender_id in media_buffer:
+        del media_buffer[sender_id]
+
 
     for entry in media_list:
         media = entry["media"]
