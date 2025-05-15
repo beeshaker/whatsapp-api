@@ -666,11 +666,6 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
         del media_buffer[sender_id]
 
 
-    for entry in media_list:
-        media = entry["media"]
-        save_ticket_media(ticket_id, media["media_type"], media["media_path"])
-        logging.info(f"📁 Linked {media['media_type']} to ticket #{ticket_id}")
-
     query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,), commit=True)
     send_whatsapp_message(sender_id, f"✅ Your ticket has been created under the *{category}* category. Our team will get back to you soon!")
     
