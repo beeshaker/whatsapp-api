@@ -2,7 +2,6 @@ import os
 import json
 import time
 import requests
-import mysql.connector
 import logging
 import threading
 from flask import Flask, request, jsonify
@@ -35,7 +34,8 @@ DB_NAME = os.getenv("DB_NAME")
 pending_confirmations = {}  # key: phone_number, value: Timer object
 # Initialize Flask app
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
+
 
 # Add at the top of your script:
 media_buffer_lock = threading.Lock()
@@ -105,26 +105,17 @@ def opt_in_user_route():
 
 
 # Function to connect to MySQL and execute queries
+
 def query_database(query, params=(), commit=False):
+    engine = get_db_connection1()
     try:
-        conn = mysql.connector.connect(
-            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-        )
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(query, params)
-
-        if commit:
-            conn.commit()
-            cursor.close()
-            conn.close()
-            return True
-
-        result = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return result
-    except mysql.connector.Error as err:
-        logging.error(f"Database error: {err}")
+        with engine.connect() as conn:
+            result = conn.execute(text(query), params)
+            if commit:
+                return True
+            return [dict(row) for row in result]
+    except Exception as e:
+        logging.error(f"DB Error: {e}")
         return None
     
     
