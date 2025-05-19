@@ -501,8 +501,8 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             captions = [message_text.strip()]
             send_caption_confirmation(sender_id, captions, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID)
         else:
-            send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
-            manage_upload_timer(sender_id)
+            # Removed the immediate text message
+            manage_upload_timer(sender_id)  # Trigger button prompt after 10 seconds
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
         logging.error(f"Failed to save {media_type}: {download_result}")
