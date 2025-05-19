@@ -310,14 +310,62 @@ def webhook():
             return request.args.get("hub.challenge"), 200
         return "Invalid verification token", 403
 
-    # POST: Handle webhook events
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
 
-    # ✅ Process inline to prevent duplicate processing
-    process_webhook(data)
+    # Offload full processing to background thread
+    executor.submit(process_webhook_async, data)
 
     return jsonify({"status": "received"}), 200
+
+
+def process_webhook_async(data):
+    """Handles incoming WhatsApp messages in background."""
+    try:
+        purge_expired_media()
+        logging.info(f"Processing webhook data asynchronously: {json.dumps(data, indent=2)}")
+        
+        if "entry" in data:
+            for entry in data["entry"]:
+                for change in entry.get("changes", []):
+                    if "statuses" in change["value"]:
+                        logging.info(f"Status update received for message ID {change['value']['statuses'][0]['id']}. Ignoring.")
+                        continue
+                    if "messages" in change["value"]:
+                        for message in change["value"]["messages"]:
+                            # Step 1: Handle message basics
+                            message_id, sender_id, message_text = extract_message_info(message)
+                            # Step 2: Check if we should process this message
+                            if not is_valid_message(sender_id, message_id, message_text):
+                                continue
+                            # Step 3: Handle media uploads
+                            if handle_media_upload(message, sender_id, message_text):
+                                continue  # Already handled
+                            # Step 4: Handle button replies
+                            if "interactive" in message and "button_reply" in message["interactive"]:
+                                handle_button_reply(message, sender_id)
+                                continue
+                            # Step 5: Handle text commands
+                            if message_text.lower() == "/clear_attachments":
+                                handle_clear_attachments(sender_id)
+                                continue
+                            # Step 6: Main menu or help
+                            if message_text.lower() in ["hi", "hello", "help", "menu"]:
+                                send_whatsapp_buttons(sender_id)
+                                continue
+                            # Step 7: Category selection
+                            user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
+                            property_data = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
+                            property = property_data[0]["property_id"] if property_data else None
+                            if user_status and user_status[0]["last_action"] == "awaiting_category":
+                                handle_category_selection(sender_id, message_text)
+                                continue
+                            # Step 8: Ticket creation
+                            if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
+                                handle_ticket_creation(sender_id, message_text, property)
+                                continue
+    except Exception as e:
+        logging.error(f"Error in async webhook processing: {e}", exc_info=True)
 
 
 @app.route("/send_message", methods=["POST"])
