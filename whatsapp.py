@@ -109,6 +109,7 @@ def opt_in_user_route():
 def query_database(query, params=(), commit=False):
     engine = get_db_connection1()
     try:
+        logging.debug(f"Running query: {query} | params: {params} | type: {type(params)}")
         with engine.connect() as conn:
             result = conn.execute(text(query), params)
             if commit:
