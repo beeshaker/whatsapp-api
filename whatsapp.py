@@ -2,6 +2,7 @@ import os
 import json
 import time
 import requests
+import mysql.connector
 import logging
 import threading
 from flask import Flask, request, jsonify
@@ -34,8 +35,7 @@ DB_NAME = os.getenv("DB_NAME")
 pending_confirmations = {}  # key: phone_number, value: Timer object
 # Initialize Flask app
 app = Flask(__name__)
-logging.basicConfig(level=logging.WARNING)
-
+logging.basicConfig(level=logging.INFO)
 
 # Add at the top of your script:
 media_buffer_lock = threading.Lock()
@@ -105,18 +105,26 @@ def opt_in_user_route():
 
 
 # Function to connect to MySQL and execute queries
-
 def query_database(query, params=(), commit=False):
-    engine = get_db_connection1()
     try:
-        logging.debug(f"Running query: {query} | params: {params} | type: {type(params)}")
-        with engine.connect() as conn:
-            result = conn.execute(text(query), params)
-            if commit:
-                return True
-            return [dict(row) for row in result]
-    except Exception as e:
-        logging.error(f"DB Error: {e}")
+        conn = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
+        )
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, params)
+
+        if commit:
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
+
+        result = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return result
+    except mysql.connector.Error as err:
+        logging.error(f"Database error: {err}")
         return None
     
     
@@ -151,7 +159,6 @@ def reset_category_selection(to):
 
     # Actions that don’t require the lock (outside the lock)
     logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
-    logging.warning(f"📌 Params being passed line 154: {to} | type: {type(to)}")
     query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
     send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
 
@@ -175,7 +182,6 @@ def is_message_processed(message_id):
     if message_id in processed_message_ids:
         return True
     query = "SELECT id FROM processed_messages WHERE id = %s"
-    logging.warning(f"📌 Params being passed line 178: {message_id} | type: {type(message_id)}")
     result = query_database(query, (message_id,))
     return bool(result)
 
@@ -183,7 +189,6 @@ def mark_message_as_processed(message_id):
     """Mark a message as processed (in-memory & database)."""
     processed_message_ids.add(message_id)  # ✅ Immediate in-memory tracking
     query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
-    logging.warning(f"📌 Params being passed line 186: {message_id} | type: {type(message_id)}")
     query_database(query, (message_id,), commit=True)
 
 def should_process_message(sender_id, message_text):
@@ -289,7 +294,6 @@ def send_whatsapp_tickets(to):
         WHERE user_id = (SELECT id FROM users WHERE whatsapp_number = %s) 
         AND status = 'Open'
     """
-    logging.warning(f"📌 Params being passed line 292: {to} | type: {type(to)}")
     tickets = query_database(query, (to,))
 
     # If no open tickets found
@@ -315,64 +319,14 @@ def webhook():
             return request.args.get("hub.challenge"), 200
         return "Invalid verification token", 403
 
+    # POST: Handle webhook events
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
 
-    # Offload full processing to background thread
-    executor.submit(process_webhook_async, data)
+    # ✅ Process inline to prevent duplicate processing
+    process_webhook(data)
 
     return jsonify({"status": "received"}), 200
-
-
-def process_webhook_async(data):
-    """Handles incoming WhatsApp messages in background."""
-    try:
-        purge_expired_media()
-        logging.info(f"Processing webhook data asynchronously: {json.dumps(data, indent=2)}")
-        
-        if "entry" in data:
-            for entry in data["entry"]:
-                for change in entry.get("changes", []):
-                    if "statuses" in change["value"]:
-                        logging.info(f"Status update received for message ID {change['value']['statuses'][0]['id']}. Ignoring.")
-                        continue
-                    if "messages" in change["value"]:
-                        for message in change["value"]["messages"]:
-                            # Step 1: Handle message basics
-                            message_id, sender_id, message_text = extract_message_info(message)
-                            # Step 2: Check if we should process this message
-                            if not is_valid_message(sender_id, message_id, message_text):
-                                continue
-                            # Step 3: Handle media uploads
-                            if handle_media_upload(message, sender_id, message_text):
-                                continue  # Already handled
-                            # Step 4: Handle button replies
-                            if "interactive" in message and "button_reply" in message["interactive"]:
-                                handle_button_reply(message, sender_id)
-                                continue
-                            # Step 5: Handle text commands
-                            if message_text.lower() == "/clear_attachments":
-                                handle_clear_attachments(sender_id)
-                                continue
-                            # Step 6: Main menu or help
-                            if message_text.lower() in ["hi", "hello", "help", "menu"]:
-                                send_whatsapp_buttons(sender_id)
-                                continue
-                            # Step 7: Category selection
-                            logging.warning(f"📌 Params being passed line 362: {sender_id} | type: {type(sender_id)}")
-                            user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
-                            logging.warning(f"📌 Params being passed line 364: {sender_id} | type: {type(sender_id)}")
-                            property_data = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
-                            property = property_data[0]["property_id"] if property_data else None
-                            if user_status and user_status[0]["last_action"] == "awaiting_category":
-                                handle_category_selection(sender_id, message_text)
-                                continue
-                            # Step 8: Ticket creation
-                            if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
-                                handle_ticket_creation(sender_id, message_text, property)
-                                continue
-    except Exception as e:
-        logging.error(f"Error in async webhook processing: {e}", exc_info=True)
 
 
 @app.route("/send_message", methods=["POST"])
@@ -649,7 +603,6 @@ def handle_button_reply(message, sender_id):
             del pending_confirmations[sender_id]
 
     if button_id == "create_ticket":
-        logging.warning(f"📌 Params being passed line 652: {sender_id} | type: {type(sender_id)}")
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         send_category_prompt(sender_id)
 
@@ -657,18 +610,15 @@ def handle_button_reply(message, sender_id):
         send_whatsapp_tickets(sender_id)
 
     elif button_id == "upload_done":
-        logging.warning(f"📌 Params being passed line 660: {sender_id} | type: {type(sender_id)}")
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
         
         if user_data and user_data[0]["temp_category"]:
-            logging.warning(f"📌 Params being passed line 664: {sender_id} | type: {type(sender_id)}")
             query_database(
                 "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
                 (sender_id,), commit=True
             )
             send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
         else:
-            logging.warning(f"📌 Params being passed line 671: {sender_id} | type: {type(sender_id)}")
             query_database(
                 "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
                 (sender_id,), commit=True
@@ -739,7 +689,6 @@ def handle_auto_submit_ticket(sender_id):
         return
 
     # Set default category and mark awaiting description
-    logging.warning(f"📌 Params being passed line 742: {sender_id} | type: {type(sender_id)}")
     query_database(
         "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
         ("Other", sender_id),
@@ -747,7 +696,7 @@ def handle_auto_submit_ticket(sender_id):
     )
 
     auto_description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(non_empty_captions)
-    logging.warning(f"📌 Params being passed line 750: {sender_id} | type: {type(sender_id)}")
+
     user_info = query_database("SELECT id, property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
     if not user_info:
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
@@ -767,7 +716,6 @@ def handle_auto_submit_ticket(sender_id):
     
     
 def create_ticket_with_media(sender_id, user_id, category, property, description):
-    logging.warning(f"📌 Params being passed line 770: {user_id} | type: {type(user_id)}")
     ticket_check = query_database("""
         SELECT created_at FROM tickets
         WHERE user_id = %s
@@ -805,7 +753,6 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
             del user_timers[sender_id]
 
     # Clear user state
-    logging.warning(f"📌 Params being passed line 770: {sender_id} | type: {type(sender_id)}")
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
@@ -844,7 +791,6 @@ def handle_clear_attachments(sender_id):
 def handle_category_selection(sender_id, message_text):
     category_name = get_category_name(message_text)
     if category_name:
-        logging.warning(f"📌 Params being passed line 847: {sender_id} | type: {type(sender_id)}")
         query_database(
             "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
             (category_name, sender_id),
@@ -859,7 +805,6 @@ def handle_category_selection(sender_id, message_text):
         
         
 def handle_ticket_creation(sender_id, message_text, property):
-    logging.warning(f"📌 Params being passed line 862: {sender_id} | type: {type(sender_id)}")
     user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
     if not user_info:
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
@@ -867,7 +812,7 @@ def handle_ticket_creation(sender_id, message_text, property):
 
     user_id = user_info[0]["id"]
     category = user_info[0]["temp_category"]
-    logging.warning(f"📌 Params being passed line 870: {sender_id} | type: {type(sender_id)}")
+
     ticket_check = query_database("""
         SELECT created_at FROM tickets
         WHERE user_id = %s
@@ -974,9 +919,7 @@ def process_webhook(data):
                             continue
 
                         # Step 7: Category selection
-                        logging.warning(f"📌 Params being passed line 977: {sender_id} | type: {type(sender_id)}")
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
-                        logging.warning(f"📌 Params being passed line 979: {sender_id} | type: {type(sender_id)}")
                         property = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))[0]["property_id"]
 
                         if user_status and user_status[0]["last_action"] == "awaiting_category":
