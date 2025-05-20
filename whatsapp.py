@@ -711,7 +711,7 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
             save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
         query_database(
             "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
-            (sender_id,), commit=True, conn=conn
+            (sender_id,), commit=True, 
         )
         conn.commit()
         send_whatsapp_message(
