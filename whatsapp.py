@@ -41,18 +41,7 @@ user_timers = {}
 MEDIA_TTL_SECONDS = 3600
 
 # Simulated database connection (replacing conn1.py functions)
-def get_db_connection1():
-    """Simulate SQLAlchemy engine for database connection."""
-    class MockEngine:
-        def connect(self):
-            return self
-        def execute(self, query, params):
-            return query_database(query, params)
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            pass
-    return MockEngine()
+
 
 def save_ticket_media(ticket_id, media_type, media_path):
     """Save media metadata to the database and link to ticket."""
@@ -213,17 +202,14 @@ def should_process_message(sender_id, message_text):
     return True
 
 def is_registered_user(whatsapp_number):
-    engine = get_db_connection1()
-    with engine.connect() as conn:
-        user_check = conn.execute(
-            text("SELECT id FROM users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number}
-        ).fetchone()
-        admin_check = conn.execute(
-            text("SELECT id FROM admin_users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number}
-        ).fetchone()
-    return user_check is not None or admin_check is not None
+    # Use query_database directly with %s placeholders
+    user_query = "SELECT id FROM users WHERE whatsapp_number = %s"
+    admin_query = "SELECT id FROM admin_users WHERE whatsapp_number = %s"
+    
+    user_check = query_database(user_query, (whatsapp_number,))
+    admin_check = query_database(admin_query, (whatsapp_number,))
+    
+    return bool(user_check) or bool(admin_check)
 
 def send_whatsapp_buttons(to):
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
