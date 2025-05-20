@@ -698,7 +698,7 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
             host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
         )
         conn.start_transaction()
-        ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id, conn=conn)
+        ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
         with media_buffer_lock:
             media_list = [
                 media_buffer[sender_id][mid]
@@ -708,7 +708,7 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
             if sender_id in media_buffer:
                 del media_buffer[sender_id]
         for entry in media_list:
-            save_ticket_media(ticket_id, entry["media_type"], entry["media_path"], conn=conn)
+            save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
         query_database(
             "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
             (sender_id,), commit=True, conn=conn
