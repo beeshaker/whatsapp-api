@@ -486,26 +486,28 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
         with media_buffer_lock:
             if sender_id not in media_buffer:
                 media_buffer[sender_id] = []
-            media_buffer[sender_id].append({
+            media_entry = {
                 "media_type": media_type,
                 "media_path": download_result["path"],
                 "caption": message_text.strip() if message_text else None,
                 "timestamp": time.time(),
-            })
+            }
+            media_buffer[sender_id].append(media_entry)
             media_count = len(media_buffer[sender_id])
+            logging.info(f"📤 Successfully added media to buffer for {sender_id}. Entry: {media_entry}, Buffer: {media_buffer[sender_id]}, Count: {media_count}")
         with user_timers_lock:
-            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "timer": None})
+            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "timer": None, "last_upload_time": 0})
             upload_state[sender_id]["media_count"] = media_count
             upload_state[sender_id]["last_upload_time"] = time.time()
+            logging.info(f"Updated upload_state for {sender_id}. State: {upload_state[sender_id]}")
         if message_text.strip():
             captions = [message_text.strip()]
             send_caption_confirmation(sender_id, captions, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID)
         else:
-            send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
             manage_upload_timer(sender_id)
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
-        logging.error(f"Failed to save {media_type}: {download_result}")
+        logging.error(f"Failed to save {media_type} for {sender_id}: {download_result}")
         
 
 def handle_button_reply(message, sender_id):
@@ -545,6 +547,10 @@ def handle_button_reply(message, sender_id):
             )
             with media_buffer_lock:
                 media_count = len(media_buffer.get(sender_id, []))
+                logging.info(f"✅ Caption confirmed for {sender_id}. Buffer: {media_buffer.get(sender_id, [])}")
+            with user_timers_lock:
+                upload_state[sender_id]["media_count"] = media_count
+                logging.info(f"Updated upload_state for {sender_id} after confirm_yes. State: {upload_state[sender_id]}")
             send_whatsapp_message(sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
             manage_upload_timer(sender_id)
         else:
@@ -554,14 +560,24 @@ def handle_button_reply(message, sender_id):
             )
             send_category_prompt(sender_id)
     elif button_id == "caption_confirm_no":
-        send_whatsapp_message(sender_id, "📝 Please upload the files again with corrected captions.")
         with media_buffer_lock:
-            if sender_id in media_buffer:
-                del media_buffer[sender_id]
+            if sender_id in media_buffer and media_buffer[sender_id]:
+                media_list = media_buffer[sender_id]
+                removed = None
+                for i in range(len(media_list) - 1, -1, -1):
+                    if media_list[i].get("caption"):
+                        removed = media_list.pop(i)
+                        break
+                if removed:
+                    logging.info(f"❌ Caption rejected for {sender_id}. Removed: {removed}. Buffer now: {media_buffer[sender_id]}")
+                if not media_buffer[sender_id]:
+                    del media_buffer[sender_id]
         with user_timers_lock:
             if sender_id in upload_state:
-                upload_state[sender_id]["media_count"] = 0
-                upload_state[sender_id]["last_upload_time"] = 0
+                upload_state[sender_id]["media_count"] = len(media_buffer.get(sender_id, []))
+                upload_state[sender_id]["last_upload_time"] = time.time() if upload_state[sender_id]["media_count"] > 0 else 0
+                logging.info(f"Updated upload_state for {sender_id} after confirm_no. State: {upload_state[sender_id]}")
+        send_whatsapp_message(sender_id, "📝 Caption rejected. Please upload that file again with a corrected caption.")
         
         
 
@@ -679,7 +695,7 @@ def handle_auto_submit_ticket(sender_id):
     
     
     
-def create_ticket_with_media(sender_id, user_id, category, property, description):
+def create_ticket_with_media(sender_id, user_id, category, property_id, description):
     ticket_check = query_database(
         "SELECT created_at FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,)
@@ -687,11 +703,12 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
     if ticket_check and (datetime.now() - ticket_check[0]["created_at"]).total_seconds() < 60:
         send_whatsapp_message(sender_id, "🛑 You've recently created a ticket. Please wait a minute before creating another.")
         return
-    ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
     with media_buffer_lock:
         media_list = media_buffer.get(sender_id, []).copy()
+        logging.info(f"📥 Saving media for ticket for {sender_id}. Media list: {media_list}, Count: {len(media_list)}")
         if sender_id in media_buffer:
             del media_buffer[sender_id]
+    ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id, assigned_admin=None)
     for entry in media_list:
         save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
         logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
@@ -703,8 +720,6 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
         sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!"
     )
-
-
 
 
 
@@ -839,12 +854,18 @@ def process_webhook(data):
                         if not is_valid_message(sender_id, message_id, message_text):
                             continue
                         if handle_media_upload(message, sender_id, message_text):
+                            with media_buffer_lock:
+                                logging.info(f"After handle_media_upload for {sender_id}. Buffer: {media_buffer.get(sender_id, [])}")
                             continue
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
+                            with media_buffer_lock:
+                                logging.info(f"After handle_button_reply for {sender_id}. Buffer: {media_buffer.get(sender_id, [])}")
                             continue
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
+                            with media_buffer_lock:
+                                logging.info(f"After clear_attachments for {sender_id}. Buffer: {media_buffer.get(sender_id, [])}")
                             continue
                         if message_text.lower() == "/done":
                             user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
@@ -868,6 +889,8 @@ def process_webhook(data):
                             try:
                                 upload_index = message_text.split()[1]
                                 handle_remove_upload(sender_id, upload_index)
+                                with media_buffer_lock:
+                                    logging.info(f"After remove_upload for {sender_id}. Buffer: {media_buffer.get(sender_id, [])}")
                             except IndexError:
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
@@ -885,4 +908,5 @@ def process_webhook(data):
                             continue
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
+                            logging.info(f"worked")
                             continue
