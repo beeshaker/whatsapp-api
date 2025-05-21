@@ -351,16 +351,32 @@ def purge_expired_media():
                     text("SELECT last_action FROM users WHERE whatsapp_number = :whatsapp_number"),
                     {"whatsapp_number": sender_id}
                 ).fetchone()
-            if user_status and user_status[0] in ["awaiting_issue_description", "awaiting_category"]:  # Access via index
+
+            # Extend to more valid states or recently active users
+            if user_status and user_status[0] in [
+                "awaiting_issue_description", "awaiting_category"
+            ]:
                 continue
+
+            # Additionally: if media uploaded recently, skip purging
+            recent_upload = any(
+                now - entry["timestamp"] < 600  # 10 minutes buffer
+                for entry in media_buffer[sender_id].values()
+            )
+            if recent_upload:
+                continue
+
+            # Proceed to clear expired media
             media_buffer[sender_id] = {
                 mid: entry
                 for mid, entry in media_buffer[sender_id].items()
                 if now - entry["timestamp"] < MEDIA_TTL_SECONDS
             }
+
             if not media_buffer[sender_id]:
                 del media_buffer[sender_id]
                 send_whatsapp_message(sender_id, "⏳ Your uploaded files have expired. Please start again.")
+
 
 def schedule_purge():
     purge_expired_media()
