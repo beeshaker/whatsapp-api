@@ -695,7 +695,7 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
 
             with media_buffer_lock:
                 media_list = [
-                    media_buffer[sender_id][mid]
+                    media_buffer[sender_id][mid].copy()
                     for mid in media_buffer.get(sender_id, {})
                     if media_buffer[sender_id][mid]["confirmed"]
                 ]
