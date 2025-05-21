@@ -240,8 +240,7 @@ def send_whatsapp_tickets(to):
     else:
         message = "Your open tickets:\n"
         for ticket in tickets:
-            message += f"Ticket ID: {ticket['id']}\nDescription: {ticket['short_description']}\nLast Update on: {ticket['last_update']}\n\n"
-    
+            message += f"Ticket ID: {ticket[0]}\nDescription: {ticket[1]}\nLast Update on: {ticket[2]}\n\n"  # Access via indices
     executor.submit(send_whatsapp_message, to, message)
 
 @app.route("/webhook", methods=["GET", "POST"])
@@ -352,7 +351,7 @@ def purge_expired_media():
                     text("SELECT last_action FROM users WHERE whatsapp_number = :whatsapp_number"),
                     {"whatsapp_number": sender_id}
                 ).fetchone()
-            if user_status and user_status["last_action"] in ["awaiting_issue_description", "awaiting_category"]:
+            if user_status and user_status[0] in ["awaiting_issue_description", "awaiting_category"]:  # Access via index
                 continue
             media_buffer[sender_id] = {
                 mid: entry
@@ -414,8 +413,8 @@ def handle_auto_submit_ticket(sender_id):
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
         return
 
-    user_id = user_info["id"]
-    property = user_info["property_id"]
+    user_id = user_info[0]  # Access first element (id)
+    property = user_info[1]  # Access second element (property_id)
 
     create_ticket_with_media(sender_id, user_id, "Other", property, auto_description)
 
@@ -479,7 +478,7 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             text("SELECT last_action, temp_category FROM users WHERE whatsapp_number = :whatsapp_number"),
             {"whatsapp_number": sender_id}
         ).fetchone()
-    if not user_status or user_status["last_action"] != "awaiting_issue_description":
+    if not user_status or user_status[0] != "awaiting_issue_description":  # Access first element (last_action)
         send_whatsapp_message(sender_id, "⚠️ Please select a category first. Reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
         return
@@ -555,7 +554,7 @@ def handle_button_reply(message, sender_id):
                     text("SELECT temp_category FROM users WHERE whatsapp_number = :whatsapp_number"),
                     {"whatsapp_number": sender_id}
                 ).fetchone()
-            if user_data and user_data["temp_category"]:
+            if user_data and user_data[0]:  # Access first element (temp_category)
                 engine = get_db_connection1()
                 with engine.connect() as conn:
                     conn.execute(
@@ -664,7 +663,7 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
     with engine.connect() as conn:
         try:
             conn.execution_options(autocommit=False)
-            ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id, conn=conn)
+            ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
             if not ticket_id:
                 raise Exception("Failed to create ticket")
 
@@ -679,9 +678,8 @@ def create_ticket_with_media(sender_id, user_id, category, property_id, descript
                     del media_buffer[sender_id]
 
             for entry in media_list:
-                save_result = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"], conn=conn)
-                if not save_result:
-                    logging.error(f"Failed to link {entry['media_type']} to ticket #{ticket_id}")
+                save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+                logging.info(f"Linked {entry['media_type']} to ticket #{ticket_id}")
 
             conn.execute(
                 text("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = :whatsapp_number"),
@@ -737,8 +735,8 @@ def handle_ticket_creation(sender_id, message_text, property):
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
         return
 
-    user_id = user_info["id"]
-    category = user_info["temp_category"]
+    user_id = user_info[0]  # Access first element (id)
+    category = user_info[1]  # Access second element (temp_category)
 
     engine = get_db_connection1()
     with engine.connect() as conn:
@@ -753,7 +751,7 @@ def handle_ticket_creation(sender_id, message_text, property):
         ).fetchone()
 
     if ticket_check:
-        last_created = ticket_check["created_at"]
+        last_created = ticket_check[0]  # Access first element (created_at)
         if (datetime.now() - last_created).total_seconds() < 60:
             logging.info(f"🛑 Ticket already created recently for user {sender_id}. Skipping.")
             return
@@ -877,7 +875,7 @@ def process_webhook(data):
                                     text("SELECT temp_category FROM users WHERE whatsapp_number = :whatsapp_number"),
                                     {"whatsapp_number": sender_id}
                                 ).fetchone()
-                            if user_data and user_data["temp_category"]:
+                            if user_data and user_data[0]:  # Access first element (temp_category)
                                 engine = get_db_connection1()
                                 with engine.connect() as conn:
                                     conn.execute(
@@ -921,15 +919,14 @@ def process_webhook(data):
                         if not user_info or not user_status:
                             send_whatsapp_message(sender_id, "⚠️ User not found. Please register.")
                             continue
-                        property = user_info["property_id"]
-                        if user_status["last_action"] == "awaiting_category":
+                        property = user_info[0]  # Access first element (property_id)
+                        if user_status[0] == "awaiting_category":  # Access first element (last_action)
                             handle_category_selection(sender_id, message_text)
                             continue
-                        if user_status["last_action"] == "awaiting_issue_description":
+                        if user_status[0] == "awaiting_issue_description":  # Access first element (last_action)
                             handle_ticket_creation(sender_id, message_text, property)
                             continue
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
                             logging.info(f"Worked: Sent menu to {sender_id}")
                             continue
-
