@@ -340,6 +340,8 @@ def download_media(media_id, filename=None):
         return {"success": True, "path": save_path}
     except Exception as e:
         return {"error": f"Exception while downloading media: {str(e)}"}
+    
+    
 
 def purge_expired_media():
     now = time.time()
@@ -352,30 +354,38 @@ def purge_expired_media():
                     {"whatsapp_number": sender_id}
                 ).fetchone()
 
-            # Extend to more valid states or recently active users
-            if user_status and user_status[0] in [
-                "awaiting_issue_description", "awaiting_category"
-            ]:
+            # 1. Skip purge for active users
+            if user_status and user_status[0] in ["awaiting_issue_description", "awaiting_category"]:
+                logging.info(f"⏸️ Skipping purge for active user {sender_id} (status: {user_status[0]})")
                 continue
 
-            # Additionally: if media uploaded recently, skip purging
+            # 2. Skip purge if any upload is recent (within 5 minutes)
             recent_upload = any(
-                now - entry["timestamp"] < 600  # 10 minutes buffer
+                now - entry["timestamp"] < 300  # 5 minutes = 300 seconds
                 for entry in media_buffer[sender_id].values()
             )
             if recent_upload:
+                logging.info(f"⏸️ Skipping purge for {sender_id} due to recent upload.")
                 continue
 
-            # Proceed to clear expired media
+            # 3. Clear only expired media
+            original_size = len(media_buffer[sender_id])
             media_buffer[sender_id] = {
                 mid: entry
                 for mid, entry in media_buffer[sender_id].items()
                 if now - entry["timestamp"] < MEDIA_TTL_SECONDS
             }
 
+            new_size = len(media_buffer[sender_id])
+            if new_size < original_size:
+                logging.info(f"♻️ Purged {original_size - new_size} expired media item(s) for {sender_id}.")
+
+            # 4. If buffer is now empty, inform the user
             if not media_buffer[sender_id]:
                 del media_buffer[sender_id]
-                send_whatsapp_message(sender_id, "⏳ Your uploaded files have expired. Please start again.")
+                logging.info(f"🧹 Media buffer cleared completely for {sender_id} due to inactivity.")
+                send_whatsapp_message(sender_id, "⏳ Your uploaded files have expired due to inactivity. Please start again.")
+
 
 
 def schedule_purge():
