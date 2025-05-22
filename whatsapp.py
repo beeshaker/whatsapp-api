@@ -489,7 +489,7 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             media_buffer[sender_id].append({
                 "media_type": media_type,
                 "media_path": download_result["path"],
-                "caption": message_text.strip() if message_text else None,
+                "caption": None,
                 "timestamp": time.time(),
             })
             media_count = len(media_buffer[sender_id])
@@ -497,11 +497,24 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "timer": None})
             upload_state[sender_id]["media_count"] = media_count
             upload_state[sender_id]["last_upload_time"] = time.time()
-        if message_text.strip():
-            captions = [message_text.strip()]
-            send_caption_confirmation(sender_id, captions, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID)
+        if media_count == 1:
+            user_info = query_database("SELECT id, property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
+            if user_info:
+                user_id = user_info[0]["id"]
+                property = user_info[0]["property_id"]
+                category = user_status[0]["temp_category"]
+                create_ticket_with_media(sender_id, user_id, category, property, "Media attachment submitted")
+            with user_timers_lock:
+                if sender_id in upload_state and upload_state[sender_id]["timer"]:
+                    upload_state[sender_id]["timer"].cancel()
+                    upload_state[sender_id]["timer"] = None
+                if sender_id in upload_state:
+                    del upload_state[sender_id]
+            with media_buffer_lock:
+                if sender_id in media_buffer:
+                    del media_buffer[sender_id]
         else:
-            send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
+            send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s).")
             manage_upload_timer(sender_id)
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
@@ -573,7 +586,7 @@ def handle_media_upload(message, sender_id, message_text):
         name, ext = os.path.splitext(base_filename)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{name}_{timestamp}{ext}"
-        executor.submit(process_media_upload, media_id, filename, sender_id, media_type, message_text)
+        executor.submit(process_media_upload, media_id, filename, sender_id, media_type, None)
         return True
     return False
 
@@ -703,7 +716,11 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
         sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!"
     )
-
+    with user_timers_lock:
+        if sender_id in upload_state:
+            if upload_state[sender_id]["timer"]:
+                upload_state[sender_id]["timer"].cancel()
+            del upload_state[sender_id]
 
 
 
@@ -815,13 +832,16 @@ def manage_upload_timer(sender_id):
             upload_state[sender_id]["timer"].cancel()
         def send_prompt():
             with user_timers_lock:
-                if sender_id in upload_state:
+                if sender_id in upload_state and upload_state[sender_id]["media_count"] > 1:
                     send_done_upload_prompt(sender_id)
                     upload_state[sender_id]["timer"] = None
-        t = Timer(10, send_prompt)
-        upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "last_upload_time": 0})
-        upload_state[sender_id]["timer"] = t
-        t.start()
+        with media_buffer_lock:
+            media_count = len(media_buffer.get(sender_id, []))
+        if media_count > 1:
+            t = Timer(10, send_prompt)
+            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": media_count, "last_upload_time": time.time()})
+            upload_state[sender_id]["timer"] = t
+            t.start()
 
 
 
