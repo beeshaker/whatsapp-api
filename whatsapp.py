@@ -537,8 +537,10 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
         logging.error(f"Failed to save {media_type} for {sender_id}: {download_result}")
+        
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
+    confirmed_media = []
 
     if button_id.startswith("caption_confirm_yes_") or button_id.startswith("caption_confirm_no_"):
         media_id = button_id.split("_", 3)[-1]
@@ -552,7 +554,9 @@ def handle_button_reply(message, sender_id):
             if sender_id in media_buffer and media_id in media_buffer[sender_id]:
                 if button_id.startswith("caption_confirm_yes_"):
                     media_buffer[sender_id][media_id]["confirmed"] = True
+                    confirmed_media.append(media_buffer[sender_id][media_id].copy())
                     media_count = len(media_buffer[sender_id])
+
                     logging.info(f"✅ Caption confirmed for {sender_id}, media_id: {media_id}")
                     logging.info(f"📦 Buffer after confirmation (before timer) for {sender_id}: {json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
 
@@ -566,9 +570,9 @@ def handle_button_reply(message, sender_id):
                     )
 
                     logging.info(f"📦 Buffer after confirmation (post-message) for {sender_id}: {json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
-                    manage_upload_timer(sender_id)
 
-                else:  # caption_confirm_no
+                    manage_upload_timer(sender_id)
+                else:
                     removed = media_buffer[sender_id].pop(media_id, None)
                     logging.info(f"❌ Caption rejected for {sender_id}, media_id: {media_id}. Removed: {removed}")
 
@@ -592,6 +596,15 @@ def handle_button_reply(message, sender_id):
                 upload_state[sender_id]["timer"] = None
 
         if button_id == "upload_done":
+            # Save all confirmed media for this user
+            with media_buffer_lock:
+                user_media = media_buffer.get(sender_id, {})
+                confirmed_media = [entry.copy() for entry in user_media.values() if entry.get("confirmed")]
+
+            if confirmed_media:
+                for media in confirmed_media:
+                    save_ticket_media(sender_id, media)
+
             engine = get_db_connection1()
             with engine.connect() as conn:
                 user_data = conn.execute(
@@ -633,6 +646,9 @@ def handle_button_reply(message, sender_id):
 
     elif button_id == "check_ticket":
         send_whatsapp_tickets(sender_id)
+
+    logging.info(f"🎯 After handle_button_reply for {sender_id}. Buffer state:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
+
 
 
 def handle_media_upload(message, sender_id, message_text):
