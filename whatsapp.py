@@ -659,9 +659,44 @@ def handle_media_upload(message, sender_id, message_text):
         name, ext = os.path.splitext(base_filename)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{name}_{timestamp}{ext}"
-        executor.submit(process_media_upload, media_id, filename, sender_id, media_type, message_text)
+
+        media_path = f"/tmp/{filename}"
+        download_success = download_media(media_id, media_path, media_type)
+
+        if not download_success:
+            send_whatsapp_message(sender_id, "⚠️ Failed to download media. Please try again.")
+            return True
+
+        with media_buffer_lock:
+            if sender_id not in media_buffer:
+                media_buffer[sender_id] = {}
+
+            media_buffer[sender_id][media_id] = {
+                "media_type": media_type,
+                "media_path": media_path,
+                "caption": message_text,
+                "timestamp": time.time(),
+                "confirmed": True  # No more caption confirmation needed
+            }
+
+            media_count = len(media_buffer[sender_id])
+            logging.info(f"📤 Added media {media_id} for {sender_id}. Buffer: {json.dumps(media_buffer[sender_id], indent=2, default=str)}, Count: {media_count}")
+
+        with user_timers_lock:
+            upload_state[sender_id] = {
+                "media_count": media_count,
+                "timer": None,
+                "last_upload_time": time.time()
+            }
+
+        send_whatsapp_message(
+            sender_id,
+            f"✅ Received media '{message_text or filename}'. You've uploaded {media_count} file(s). Send more or reply /done to proceed."
+        )
+
         return True
     return False
+
 
 def handle_list_uploads(sender_id):
     with media_buffer_lock:
