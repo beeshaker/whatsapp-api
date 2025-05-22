@@ -880,28 +880,36 @@ def process_webhook(data):
                         message_id, sender_id, message_text = extract_message_info(message)
                         if not is_valid_message(sender_id, message_id, message_text):
                             continue
+
                         if handle_media_upload(message, sender_id, message_text):
                             with media_buffer_lock:
-                                logging.info(f"After handle_media_upload for {sender_id}. Buffer: {media_buffer.get(sender_id, {})}")
+                                logging.info(f"📥 After handle_media_upload for {sender_id}. Buffer state:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
                             continue
+
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
                             with media_buffer_lock:
-                                logging.info(f"After handle_button_reply for {sender_id}. Buffer: {media_buffer.get(sender_id, {})}")
+                                logging.info(f"🎯 After handle_button_reply for {sender_id}. Buffer state:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
                             continue
+
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
                             with media_buffer_lock:
-                                logging.info(f"After clear_attachments for {sender_id}. Buffer: {media_buffer.get(sender_id, {})}")
+                                logging.info(f"🧹 After clear_attachments for {sender_id}. Buffer state:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
                             continue
+
                         if message_text.lower() == "/done":
+                            with media_buffer_lock:
+                                logging.info(f"📌 /done received. Current buffer for {sender_id}:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
+
                             engine = get_db_connection1()
                             with engine.connect() as conn:
                                 user_data = conn.execute(
                                     text("SELECT temp_category FROM users WHERE whatsapp_number = :whatsapp_number"),
                                     {"whatsapp_number": sender_id}
                                 ).fetchone()
-                            if user_data and user_data[0]:  # Access first element (temp_category)
+
+                            if user_data and user_data[0]:  # temp_category exists
                                 engine = get_db_connection1()
                                 with engine.connect() as conn:
                                     conn.execute(
@@ -920,18 +928,22 @@ def process_webhook(data):
                                     conn.commit()
                                 send_category_prompt(sender_id)
                             continue
+
                         if message_text.lower() == "/list_uploads":
                             handle_list_uploads(sender_id)
                             continue
+
                         if message_text.lower().startswith("/remove_upload"):
                             try:
                                 upload_index = message_text.split()[1]
                                 handle_remove_upload(sender_id, upload_index)
                                 with media_buffer_lock:
-                                    logging.info(f"After remove_upload for {sender_id}. Buffer: {media_buffer.get(sender_id, {})}")
+                                    logging.info(f"🗑️ After remove_upload for {sender_id}. Buffer state:\n{json.dumps(media_buffer.get(sender_id, {}), indent=2, default=str)}")
                             except IndexError:
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
+
+                        # Ticket creation workflow
                         engine = get_db_connection1()
                         with engine.connect() as conn:
                             user_status = conn.execute(
@@ -942,17 +954,22 @@ def process_webhook(data):
                                 text("SELECT property_id FROM users WHERE whatsapp_number = :whatsapp_number"),
                                 {"whatsapp_number": sender_id}
                             ).fetchone()
+
                         if not user_info or not user_status:
                             send_whatsapp_message(sender_id, "⚠️ User not found. Please register.")
                             continue
-                        property = user_info[0]  # Access first element (property_id)
-                        if user_status[0] == "awaiting_category":  # Access first element (last_action)
+
+                        property = user_info[0]  # property_id
+
+                        if user_status[0] == "awaiting_category":
                             handle_category_selection(sender_id, message_text)
                             continue
-                        if user_status[0] == "awaiting_issue_description":  # Access first element (last_action)
+
+                        if user_status[0] == "awaiting_issue_description":
                             handle_ticket_creation(sender_id, message_text, property)
                             continue
+
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
-                            logging.info(f"Worked: Sent menu to {sender_id}")
+                            logging.info(f"📨 Sent menu to {sender_id}")
                             continue
