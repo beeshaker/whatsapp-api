@@ -477,10 +477,12 @@ def is_valid_message(sender_id, message_id, message_text):
 
 def process_media_upload(media_id, filename, sender_id, media_type, message_text):
     user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+    
     if not user_status or user_status[0]["last_action"] != "awaiting_issue_description":
         send_whatsapp_message(sender_id, "⚠️ Please select a category first. Reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
         return
+
     download_result = download_media(media_id, filename)
     if "success" in download_result:
         with media_buffer_lock:
@@ -493,33 +495,36 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
                 "timestamp": time.time(),
             })
             media_count = len(media_buffer[sender_id])
+
         with user_timers_lock:
             upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "timer": None})
             upload_state[sender_id]["media_count"] = media_count
             upload_state[sender_id]["last_upload_time"] = time.time()
+
+        # ✅ After first upload, ask user to describe the issue (don't create ticket yet)
         if media_count == 1:
-            user_info = query_database("SELECT id, property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
-            if user_info:
-                user_id = user_info[0]["id"]
-                property = user_info[0]["property_id"]
-                category = user_status[0]["temp_category"]
-                create_ticket_with_media(sender_id, user_id, category, property, "Media attachment submitted")
-            with user_timers_lock:
-                if sender_id in upload_state and upload_state[sender_id]["timer"]:
-                    upload_state[sender_id]["timer"].cancel()
-                    upload_state[sender_id]["timer"] = None
-                if sender_id in upload_state:
-                    del upload_state[sender_id]
-            with media_buffer_lock:
-                if sender_id in media_buffer:
-                    del media_buffer[sender_id]
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+                (sender_id,), commit=True
+            )
+            send_whatsapp_message(sender_id, "✅ File received! Please describe your issue to continue.")
+
+            # Optional reminder after 2 minutes
+            def prompt_for_description_reminder(sid):
+                time.sleep(120)
+                user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sid,))
+                if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
+                    send_whatsapp_message(sid, "⏳ Please describe your issue so we can proceed with the ticket.")
+            threading.Thread(target=prompt_for_description_reminder, args=(sender_id,), daemon=True).start()
+
         else:
             send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s).")
             manage_upload_timer(sender_id)
+
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
         logging.error(f"Failed to save {media_type}: {download_result}")
-        
+
 
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
