@@ -36,6 +36,8 @@ processed_message_ids = set()
 last_messages = {}  # { sender_id: (message_text, timestamp) }
 media_buffer = {}  # { sender_id: [{ media_type, media_path, caption, timestamp }] }
 upload_state = {}  # { sender_id: { timer, last_upload_time, media_count } }
+terms_pending_users = {}  # sender_id: timestamp
+
 
 
 
@@ -103,6 +105,45 @@ def reset_category_selection(to):
     logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
     query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
     send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
+    
+    
+def send_terms_prompt(sender_id):
+    terms_url = os.getenv("TERMS_URL", "https://example.com/terms")
+    privacy_url = os.getenv("PRIVACY_URL", "https://example.com/privacy")
+
+    message = (
+        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
+        f"🔗 Terms of Service: {terms_url}\n"
+        f"🔗 Privacy Policy: {privacy_url}\n\n"
+        f"Please confirm if you accept these terms."
+    )
+
+    url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": sender_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": { "text": message },
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
+                    {"type": "reply", "reply": {"id": "reject_terms", "title": "❌ Reject"}}
+                ]
+            }
+        }
+    }
+
+    terms_pending_users[sender_id] = time.time()
+    response = requests.post(url, headers=headers, json=payload)
+    logging.info(f"Sent terms prompt to {sender_id}: {response.json()}")
+
 
 @app.route('/opt_in_user', methods=['POST'])
 def opt_in_user_route():
@@ -111,38 +152,20 @@ def opt_in_user_route():
 
     data = request.json
     whatsapp_number = data.get("whatsapp_number")
-    
+
     if not whatsapp_number:
         return jsonify({"error": "Missing whatsapp_number"}), 400
 
-    url = f"https://graph.facebook.com/v22.0/{os.getenv('WHATSAPP_PHONE_NUMBER_ID')}/messages"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('WHATSAPP_ACCESS_TOKEN')}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": whatsapp_number,
-        "type": "template",
-        "template": {
-            "name": "registration_welcome",
-            "language": {"code": "en"},
-            "components": [
-                {
-                    "type": "body",
-                    "parameters": [
-                        {"type": "text", "text": "Welcome to our service! You are now registered."}
-                    ]
-                }
-            ]
-        }
-    }
+    # Check if already opted in (optional)
+    already_registered = query_database(
+        "SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,)
+    )
+    if already_registered:
+        return jsonify({"status": "already_registered"}), 200
 
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        return jsonify({"status": "success", "details": response.json()}), response.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    send_terms_prompt(whatsapp_number)
+    return jsonify({"status": "terms_sent"}), 200
+
 
 
 
@@ -397,6 +420,27 @@ def purge_expired_media():
             else:
                 del media_buffer[wa_id]
                 send_whatsapp_message(wa_id, "⏳ Your uploaded files have expired. Please start again.")
+                
+                
+def purge_expired_items():
+    now = time.time()
+
+    # Purge expired media uploads
+    with media_buffer_lock:
+        for wa_id, media_list in list(media_buffer.items()):
+            fresh_media = [entry for entry in media_list if now - entry["timestamp"] < MEDIA_TTL_SECONDS]
+            if fresh_media:
+                media_buffer[wa_id] = fresh_media
+            else:
+                del media_buffer[wa_id]
+                send_whatsapp_message(wa_id, "⏳ Your uploaded files have expired. Please start again.")
+
+    # Purge expired terms prompts (10 min expiry)
+    expired = [uid for uid, ts in terms_pending_users.items() if now - ts > 600]
+    for uid in expired:
+        del terms_pending_users[uid]
+        send_whatsapp_message(uid, "⏳ Your session to accept Terms expired. Please try again.")
+
 
         
         
@@ -528,49 +572,59 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
 
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
+
     if button_id in ["upload_done", "upload_not_done", "caption_confirm_yes", "caption_confirm_no"]:
         with user_timers_lock:
             if sender_id in upload_state and upload_state[sender_id]["timer"]:
                 upload_state[sender_id]["timer"].cancel()
                 upload_state[sender_id]["timer"] = None
-    if button_id == "create_ticket":
+
+    if button_id == "accept_terms":
+        if sender_id in terms_pending_users:
+            del terms_pending_users[sender_id]
+            # Add to users table
+            query_database("INSERT INTO users (whatsapp_number) VALUES (%s)", (sender_id,), commit=True)
+            send_whatsapp_message(sender_id, "🎉 Thank you! You are now registered.")
+            send_whatsapp_buttons(sender_id)
+        else:
+            send_whatsapp_message(sender_id, "⚠️ This session has expired. Please try again.")
+
+    elif button_id == "reject_terms":
+        if sender_id in terms_pending_users:
+            del terms_pending_users[sender_id]
+        send_whatsapp_message(sender_id, "❌ You must accept the Terms to use this service.")
+
+    elif button_id == "create_ticket":
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         send_category_prompt(sender_id)
+
     elif button_id == "check_ticket":
         send_whatsapp_tickets(sender_id)
+
     elif button_id == "upload_done":
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
         if user_data and user_data[0]["temp_category"]:
-            query_database(
-                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-                (sender_id,), commit=True
-            )
+            query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
         else:
-            query_database(
-                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
-                (sender_id,), commit=True
-            )
+            query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             send_category_prompt(sender_id)
+
     elif button_id == "upload_not_done":
         send_whatsapp_message(sender_id, "👍 Okay, send more files when you're ready.")
+
     elif button_id == "caption_confirm_yes":
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
         if user_data and user_data[0]["temp_category"]:
-            query_database(
-                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-                (sender_id,), commit=True
-            )
+            query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             with media_buffer_lock:
                 media_count = len(media_buffer.get(sender_id, []))
             send_whatsapp_message(sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
             manage_upload_timer(sender_id)
         else:
-            query_database(
-                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
-                (sender_id,), commit=True
-            )
+            query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             send_category_prompt(sender_id)
+
     elif button_id == "caption_confirm_no":
         send_whatsapp_message(sender_id, "📝 Please upload the files again with corrected captions.")
         with media_buffer_lock:
@@ -580,6 +634,7 @@ def handle_button_reply(message, sender_id):
             if sender_id in upload_state:
                 upload_state[sender_id]["media_count"] = 0
                 upload_state[sender_id]["last_upload_time"] = 0
+
         
         
 
@@ -851,44 +906,52 @@ def manage_upload_timer(sender_id):
 
 
 def process_webhook(data):
-    purge_expired_media()
+    purge_expired_items()
     logging.info(f"Processing webhook data: {json.dumps(data, indent=2)}")
+
     if "entry" in data:
         for entry in data["entry"]:
             for change in entry.get("changes", []):
                 if "statuses" in change["value"]:
                     continue
+
                 if "messages" in change["value"]:
                     for message in change["value"]["messages"]:
                         message_id, sender_id, message_text = extract_message_info(message)
+
+                        # Block if pending terms
+                        if sender_id in terms_pending_users:
+                            send_whatsapp_message(sender_id, "📜 Please accept the Terms of Service to proceed.")
+                            continue
+
                         if not is_valid_message(sender_id, message_id, message_text):
                             continue
+
                         if handle_media_upload(message, sender_id, message_text):
                             continue
+
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
                             continue
+
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
                             continue
+
                         if message_text.lower() == "/done":
                             user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
                             if user_data and user_data[0]["temp_category"]:
-                                query_database(
-                                    "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-                                    (sender_id,), commit=True
-                                )
+                                query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
                             else:
-                                query_database(
-                                    "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
-                                    (sender_id,), commit=True
-                                )
+                                query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
                                 send_category_prompt(sender_id)
                             continue
+
                         if message_text.lower() == "/list_uploads":
                             handle_list_uploads(sender_id)
                             continue
+
                         if message_text.lower().startswith("/remove_upload"):
                             try:
                                 upload_index = message_text.split()[1]
@@ -896,18 +959,23 @@ def process_webhook(data):
                             except IndexError:
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
+
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
+
                         if not user_info or not user_status:
                             send_whatsapp_message(sender_id, "⚠️ User not found. Please register.")
                             continue
+
                         property = user_info[0]["property_id"]
                         if user_status[0]["last_action"] == "awaiting_category":
                             handle_category_selection(sender_id, message_text)
                             continue
+
                         if user_status[0]["last_action"] == "awaiting_issue_description":
                             handle_ticket_creation(sender_id, message_text, property)
                             continue
+
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
                             continue
