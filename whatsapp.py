@@ -582,36 +582,35 @@ def handle_button_reply(message, sender_id):
     if button_id == "accept_terms":
         if sender_id in terms_pending_users:
             del terms_pending_users[sender_id]
-            # Add to users table
             query_database("INSERT INTO users (whatsapp_number) VALUES (%s)", (sender_id,), commit=True)
-            send_whatsapp_message(sender_id, "🎉 Thank you! You are now registered.")
-            send_whatsapp_buttons(sender_id)
+            executor.submit(send_whatsapp_message, sender_id, "🎉 Thank you! You are now registered.")
+            executor.submit(send_whatsapp_buttons, sender_id)
         else:
-            send_whatsapp_message(sender_id, "⚠️ This session has expired. Please try again.")
+            executor.submit(send_whatsapp_message, sender_id, "⚠️ This session has expired. Please try again.")
 
     elif button_id == "reject_terms":
         if sender_id in terms_pending_users:
             del terms_pending_users[sender_id]
-        send_whatsapp_message(sender_id, "❌ You must accept the Terms to use this service.")
+        executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
 
     elif button_id == "create_ticket":
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-        send_category_prompt(sender_id)
+        executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "check_ticket":
-        send_whatsapp_tickets(sender_id)
+        executor.submit(send_whatsapp_tickets, sender_id)
 
     elif button_id == "upload_done":
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
         if user_data and user_data[0]["temp_category"]:
             query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-            send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
+            executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
         else:
             query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-            send_category_prompt(sender_id)
+            executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "upload_not_done":
-        send_whatsapp_message(sender_id, "👍 Okay, send more files when you're ready.")
+        executor.submit(send_whatsapp_message, sender_id, "👍 Okay, send more files when you're ready.")
 
     elif button_id == "caption_confirm_yes":
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
@@ -619,14 +618,14 @@ def handle_button_reply(message, sender_id):
             query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             with media_buffer_lock:
                 media_count = len(media_buffer.get(sender_id, []))
-            send_whatsapp_message(sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
+            executor.submit(send_whatsapp_message, sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
             manage_upload_timer(sender_id)
         else:
             query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-            send_category_prompt(sender_id)
+            executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "caption_confirm_no":
-        send_whatsapp_message(sender_id, "📝 Please upload the files again with corrected captions.")
+        executor.submit(send_whatsapp_message, sender_id, "📝 Please upload the files again with corrected captions.")
         with media_buffer_lock:
             if sender_id in media_buffer:
                 del media_buffer[sender_id]
@@ -670,13 +669,13 @@ def handle_remove_upload(sender_id, upload_index):
         with media_buffer_lock:
             if sender_id in media_buffer and 0 <= index < len(media_buffer[sender_id]):
                 removed = media_buffer[sender_id].pop(index)
-                send_whatsapp_message(sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
+                executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
                 if not media_buffer[sender_id]:
                     del media_buffer[sender_id]
             else:
-                send_whatsapp_message(sender_id, "⚠️ Invalid upload number.")
+                executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
     except ValueError:
-        send_whatsapp_message(sender_id, "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).")
+        executor.submit(send_whatsapp_message, sender_id, "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).")
         
         
 
@@ -758,7 +757,7 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
         (user_id,)
     )
     if ticket_check and (datetime.now() - ticket_check[0]["created_at"]).total_seconds() < 60:
-        send_whatsapp_message(sender_id, "🛑 You've recently created a ticket. Please wait a minute before creating another.")
+        executor.submit(send_whatsapp_message, sender_id, "🛑 You've recently created a ticket. Please wait a minute before creating another.")
         return
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
     with media_buffer_lock:
@@ -772,10 +771,8 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
     )
-    send_whatsapp_message(
-        sender_id,
-        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!"
-    )
+    executor.submit(send_whatsapp_message, sender_id,
+        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!")
     with user_timers_lock:
         if sender_id in upload_state:
             if upload_state[sender_id]["timer"]:
@@ -791,10 +788,9 @@ def handle_clear_attachments(sender_id):
         if sender_id in media_buffer:
             count = len(media_buffer[sender_id])
             del media_buffer[sender_id]
-            send_whatsapp_message(sender_id, f"🗑️ Cleared {count} pending attachment(s).")
+            executor.submit(send_whatsapp_message, sender_id, f"🗑️ Cleared {count} pending attachment(s).")
         else:
-            send_whatsapp_message(sender_id, "📎 You have no pending attachments.")
-
+            executor.submit(send_whatsapp_message, sender_id, "📎 You have no pending attachments.")
         
         
 def handle_category_selection(sender_id, message_text):
@@ -805,12 +801,13 @@ def handle_category_selection(sender_id, message_text):
             (category_name, sender_id),
             commit=True
         )
-        send_whatsapp_message(sender_id, "Please describe your issue, or upload a supporting file.")
-        if sender_id in user_timers:
-            del user_timers[sender_id]
+        executor.submit(send_whatsapp_message, sender_id, "Please describe your issue, or upload a supporting file.")
+        with user_timers_lock:
+            if sender_id in user_timers:
+                del user_timers[sender_id]
     else:
-        send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
-        send_category_prompt(sender_id)
+        executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
+        executor.submit(send_category_prompt, sender_id)
         
         
 def handle_ticket_creation(sender_id, message_text, property):
