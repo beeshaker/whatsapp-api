@@ -187,20 +187,25 @@ def opt_in_user_route():
 
     data = request.json
     whatsapp_number = data.get("whatsapp_number")
+    
+    if not whatsapp_number:
+        logging.warning("❌ Missing whatsapp_number")
+        return jsonify({"error": "Missing whatsapp_number"}), 400
+
+    logging.info(f"Checking if {whatsapp_number} is already_registered")
+
     already_registered = query_database(
         "SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,)
     )
-    logging.info(f"Checking if {whatsapp_number} is already_registered")
 
-    if not whatsapp_number:
-        return jsonify({"error": "Missing whatsapp_number"}), 400
-    elif already_registered:
+    if already_registered:
+        logging.info(f"User {whatsapp_number} is already registered. Skipping opt-in.")
         return jsonify({"status": "already_registered"}), 200
-    else:
-        logging.info(f"sending terms prompt for {whatsapp_number}")
 
-        send_terms_prompt(whatsapp_number)
-        return jsonify({"status": "terms_sent"}), 200
+    logging.info(f"➡️ Not registered. Sending terms prompt to {whatsapp_number}")
+    send_terms_prompt(whatsapp_number)
+    return jsonify({"status": "terms_sent"}), 200
+
 
 
 
