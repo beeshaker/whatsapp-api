@@ -108,34 +108,75 @@ def reset_category_selection(to: str):
     
     
 def send_terms_prompt(sender_id):
+    import re
+
+    # Validate sender_id format
+    if not re.fullmatch(r"\d{10,15}", str(sender_id)):
+        logging.error(f"❌ Invalid sender_id format: {sender_id}")
+        return
+
     terms_url = os.getenv("TERMS_URL", "https://example.com/terms")
     privacy_url = os.getenv("PRIVACY_URL", "https://example.com/privacy")
 
-    message = (
-        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
-        f"🔗 Terms of Service: {terms_url}\n"
-        f"🔗 Privacy Policy: {privacy_url}\n\n"
-        f"Please confirm if you accept these terms."
-    )
+    # Attempt plain text message first (simpler to debug)
+    text_payload = {
+        "messaging_product": "whatsapp",
+        "to": sender_id,
+        "type": "text",
+        "text": {
+            "body": f"📜 Please review our Terms of Service here: {terms_url}"
+        }
+    }
 
-    url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    payload = {
-    "messaging_product": "whatsapp",
-    "to": sender_id,
-    "type": "text",
-    "text": {
-        "body": "📜 Please review our Terms of Service here: https://example.com/terms"
-        }
-    }   
+    # Attempt text message
+    response = requests.post(url, headers=headers, json=text_payload)
+    logging.info(f"[Text] Status: {response.status_code}")
+    logging.info(f"[Text] Body: {response.text}")
 
-    terms_pending_users[sender_id] = time.time()
-    response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Sent terms prompt to {sender_id}: {response.json()}")
+    if response.status_code == 200 and "messages" in response.json():
+        terms_pending_users[sender_id] = time.time()
+        logging.info(f"✅ Text terms prompt sent to {sender_id}")
+        return
+
+    # Fallback to interactive message
+    interactive_message = (
+        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
+        f"🔗 Terms: {terms_url}\n"
+        f"🔗 Privacy: {privacy_url}\n\n"
+        f"Do you accept these terms?"
+    )
+
+    interactive_payload = {
+        "messaging_product": "whatsapp",
+        "to": sender_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": { "text": interactive_message },
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
+                    {"type": "reply", "reply": {"id": "reject_terms", "title": "❌ Reject"}}
+                ]
+            }
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=interactive_payload)
+    logging.info(f"[Interactive] Status: {response.status_code}")
+    logging.info(f"[Interactive] Body: {response.text}")
+
+    if response.status_code == 200 and "messages" in response.json():
+        terms_pending_users[sender_id] = time.time()
+        logging.info(f"✅ Interactive terms prompt sent to {sender_id}")
+    else:
+        logging.error("❌ Failed to send both text and interactive terms prompt.")
 
 
 @app.route('/opt_in_user', methods=['POST'])
