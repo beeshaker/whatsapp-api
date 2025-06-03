@@ -966,26 +966,17 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id, sender_id, message_text = extract_message_info(message)
 
-                        # ✅ If user has not accepted terms, block normal messages
-                        if sender_id in terms_pending_users:
-                            if "interactive" not in message:
-                                send_whatsapp_message(sender_id, "📜 Please accept the Terms of Service to proceed.")
-                                continue
-
-                        # ✅ Handle button replies (including accept_terms / reject_terms)
+                        # ✅ Allow and handle interactive button replies (e.g., accept_terms)
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
                             continue
 
-                        # ✅ Prevent processing duplicate or invalid messages
                         if not is_valid_message(sender_id, message_id, message_text):
                             continue
 
-                        # ✅ Handle media uploads
                         if handle_media_upload(message, sender_id, message_text):
                             continue
 
-                        # ✅ Commands
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
                             continue
@@ -1006,7 +997,6 @@ def process_webhook(data):
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
 
-                        # ✅ Fetch user status and property info
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
 
