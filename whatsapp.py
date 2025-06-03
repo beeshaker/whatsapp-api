@@ -133,7 +133,7 @@ def send_terms_prompt(sender_id):
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": { "text": message },
+            "body": {"text": message},
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
@@ -148,6 +148,7 @@ def send_terms_prompt(sender_id):
     logging.info(f"Sent terms prompt to {sender_id}: {response.json()}")
 
 
+
 @app.route('/opt_in_user', methods=['POST'])
 def opt_in_user_route():
     if request.headers.get("X-API-KEY") != os.getenv("INTERNAL_API_KEY"):
@@ -160,9 +161,10 @@ def opt_in_user_route():
     unit_number = data.get("unit_number")
 
     if not all([name, whatsapp_number, property_id, unit_number]):
+        logging.error("Missing fields in opt-in request.")
         return jsonify({"error": "Missing fields"}), 400
 
-    # Store user data in memory for now (one request cycle) — better: use DB if needed long-term
+    logging.info(f"Storing opt-in data for {whatsapp_number}: {name}, {property_id}, {unit_number}")
     temp_opt_in_data[whatsapp_number] = {
         "name": name,
         "property_id": property_id,
@@ -171,6 +173,7 @@ def opt_in_user_route():
 
     send_terms_prompt(whatsapp_number)
     return jsonify({"status": "terms_sent"}), 200
+
 
 
 
@@ -580,29 +583,39 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
 
-    if button_id in ["upload_done", "upload_not_done", "caption_confirm_yes", "caption_confirm_no"]:
-        with user_timers_lock:
-            if sender_id in upload_state and upload_state[sender_id]["timer"]:
-                upload_state[sender_id]["timer"].cancel()
-                upload_state[sender_id]["timer"] = None
+    logging.info(f"Button reply received from sender_id: {sender_id}")
+    logging.info(f"Button payload: {json.dumps(message, indent=2)}")
 
-    elif button_id == "accept_terms":
+    if button_id == "accept_terms":
+        logging.info(f"Looking up sender_id in temp_opt_in_data: {sender_id}")
+        logging.info(f"Available keys: {list(temp_opt_in_data.keys())}")
+
         user = temp_opt_in_data.get(sender_id)
-        if user:
-            query_database("""
-                INSERT INTO users (name, whatsapp_number, property_id, unit_number)
-                VALUES (%s, %s, %s, %s)
-            """, (user["name"], sender_id, user["property_id"], user["unit_number"]), commit=True)
 
-            del temp_opt_in_data[sender_id]
-            executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
+        if user:
+            try:
+                already_exists = query_database("SELECT id FROM users WHERE whatsapp_number = %s", (sender_id,))
+                if already_exists:
+                    executor.submit(send_whatsapp_message, sender_id, "ℹ️ You’re already registered.")
+                else:
+                    query_database("""
+                        INSERT INTO users (name, whatsapp_number, property_id, unit_number)
+                        VALUES (%s, %s, %s, %s)
+                    """, (user["name"], sender_id, user["property_id"], user["unit_number"]), commit=True)
+                    executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
+
+                del temp_opt_in_data[sender_id]
+
+            except Exception as e:
+                logging.error(f"❌ Error inserting user into database: {e}")
+                executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong during registration. Please try again.")
         else:
+            logging.error(f"❌ Could not find sender_id {sender_id} in temp_opt_in_data.")
             executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
 
-
     elif button_id == "reject_terms":
-        if sender_id in terms_pending_users:
-            del terms_pending_users[sender_id]
+        if sender_id in temp_opt_in_data:
+            del temp_opt_in_data[sender_id]
         executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
 
     elif button_id == "create_ticket":
