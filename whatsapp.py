@@ -111,8 +111,8 @@ def reset_category_selection(to: str):
     
     
 def send_terms_prompt(sender_id):
-    terms_url = os.getenv("TERMS_URL", "https://example.com/terms")
-    privacy_url = os.getenv("PRIVACY_URL", "https://example.com/privacy")
+    terms_url = os.getenv("TERMS_URL", "https://digiagekenya.com/apricot/TermsofService.html")
+    privacy_url = os.getenv("PRIVACY_URL", "https://digiagekenya.com/apricot/policy.html")
 
     message = (
         f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
