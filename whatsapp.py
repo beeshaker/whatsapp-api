@@ -125,20 +125,13 @@ def send_terms_prompt(sender_id):
     }
 
     payload = {
-        "messaging_product": "whatsapp",
-        "to": sender_id,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": { "text": message },
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
-                    {"type": "reply", "reply": {"id": "reject_terms", "title": "❌ Reject"}}
-                ]
-            }
+    "messaging_product": "whatsapp",
+    "to": sender_id,
+    "type": "text",
+    "text": {
+        "body": "📜 Please review our Terms of Service here: https://example.com/terms"
         }
-    }
+    }   
 
     terms_pending_users[sender_id] = time.time()
     response = requests.post(url, headers=headers, json=payload)
