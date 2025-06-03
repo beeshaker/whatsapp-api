@@ -12,6 +12,7 @@ from sqlalchemy.sql import text
 from threading import Timer
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 # Initialize Flask app and executor
 app = Flask(__name__)
@@ -108,8 +109,7 @@ def reset_category_selection(to: str):
     
     
 def send_terms_prompt(sender_id):
-    import re
-
+    
     # Validate sender_id format
     if not re.fullmatch(r"\d{10,15}", str(sender_id)):
         logging.error(f"❌ Invalid sender_id format: {sender_id}")
@@ -174,6 +174,7 @@ def send_terms_prompt(sender_id):
 
     if response.status_code == 200 and "messages" in response.json():
         terms_pending_users[sender_id] = time.time()
+        logging.info(f"[Text] Body: {response.text}")
         logging.info(f"✅ Interactive terms prompt sent to {sender_id}")
     else:
         logging.error("❌ Failed to send both text and interactive terms prompt.")
@@ -186,19 +187,20 @@ def opt_in_user_route():
 
     data = request.json
     whatsapp_number = data.get("whatsapp_number")
-
-    if not whatsapp_number:
-        return jsonify({"error": "Missing whatsapp_number"}), 400
-
-    # Check if already opted in (optional)
     already_registered = query_database(
         "SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,)
     )
-    if already_registered:
-        return jsonify({"status": "already_registered"}), 200
+    logging.info(f"Checking if {whatsapp_number} is already_registered")
 
-    send_terms_prompt(whatsapp_number)
-    return jsonify({"status": "terms_sent"}), 200
+    if not whatsapp_number:
+        return jsonify({"error": "Missing whatsapp_number"}), 400
+    elif already_registered:
+        return jsonify({"status": "already_registered"}), 200
+    else:
+        logging.info(f"sending terms prompt for {whatsapp_number}")
+
+        send_terms_prompt(whatsapp_number)
+        return jsonify({"status": "terms_sent"}), 200
 
 
 
