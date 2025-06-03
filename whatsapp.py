@@ -109,56 +109,29 @@ def reset_category_selection(to: str):
     
     
 def send_terms_prompt(sender_id):
-    
-    # Validate sender_id format
-    if not re.fullmatch(r"\d{10,15}", str(sender_id)):
-        logging.error(f"❌ Invalid sender_id format: {sender_id}")
-        return
-
     terms_url = os.getenv("TERMS_URL", "https://example.com/terms")
     privacy_url = os.getenv("PRIVACY_URL", "https://example.com/privacy")
 
-    # Attempt plain text message first (simpler to debug)
-    text_payload = {
-        "messaging_product": "whatsapp",
-        "to": sender_id,
-        "type": "text",
-        "text": {
-            "body": f"📜 Please review our Terms of Service here: {terms_url}"
-        }
-    }
+    message = (
+        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
+        f"🔗 Terms of Service: {terms_url}\n"
+        f"🔗 Privacy Policy: {privacy_url}\n\n"
+        f"Please confirm if you accept these terms."
+    )
 
-    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    # Attempt text message
-    response = requests.post(url, headers=headers, json=text_payload)
-    logging.info(f"[Text] Status: {response.status_code}")
-    logging.info(f"[Text] Body: {response.text}")
-
-    if response.status_code == 200 and "messages" in response.json():
-        terms_pending_users[sender_id] = time.time()
-        logging.info(f"✅ Text terms prompt sent to {sender_id}")
-        return
-
-    # Fallback to interactive message
-    interactive_message = (
-        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
-        f"🔗 Terms: {terms_url}\n"
-        f"🔗 Privacy: {privacy_url}\n\n"
-        f"Do you accept these terms?"
-    )
-
-    interactive_payload = {
+    payload = {
         "messaging_product": "whatsapp",
         "to": sender_id,
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": { "text": interactive_message },
+            "body": { "text": message },
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
@@ -168,16 +141,9 @@ def send_terms_prompt(sender_id):
         }
     }
 
-    response = requests.post(url, headers=headers, json=interactive_payload)
-    logging.info(f"[Interactive] Status: {response.status_code}")
-    logging.info(f"[Interactive] Body: {response.text}")
-
-    if response.status_code == 200 and "messages" in response.json():
-        terms_pending_users[sender_id] = time.time()
-        logging.info(f"[Text] Body: {response.text}")
-        logging.info(f"✅ Interactive terms prompt sent to {sender_id}")
-    else:
-        logging.error("❌ Failed to send both text and interactive terms prompt.")
+    terms_pending_users[sender_id] = time.time()
+    response = requests.post(url, headers=headers, json=payload)
+    logging.info(f"Sent terms prompt to {sender_id}: {response.json()}")
 
 
 @app.route('/opt_in_user', methods=['POST'])
@@ -187,25 +153,20 @@ def opt_in_user_route():
 
     data = request.json
     whatsapp_number = data.get("whatsapp_number")
-    
-    if not whatsapp_number:
-        logging.warning("❌ Missing whatsapp_number")
-        return jsonify({"error": "Missing whatsapp_number"}), 400
-
-    logging.info(f"Checking if {whatsapp_number} is already_registered")
-
     already_registered = query_database(
         "SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,)
     )
+    logging.info(f"Checking if {whatsapp_number} is already_registered")
 
-    if already_registered:
-        logging.info(f"User {whatsapp_number} is already registered. Skipping opt-in.")
+    if not whatsapp_number:
+        return jsonify({"error": "Missing whatsapp_number"}), 400
+    elif already_registered:
         return jsonify({"status": "already_registered"}), 200
+    else:
+        logging.info(f"sending terms prompt for {whatsapp_number}")
 
-    logging.info(f"➡️ Not registered. Sending terms prompt to {whatsapp_number}")
-    send_terms_prompt(whatsapp_number)
-    return jsonify({"status": "terms_sent"}), 200
-
+        send_terms_prompt(whatsapp_number)
+        return jsonify({"status": "terms_sent"}), 200
 
 
 
