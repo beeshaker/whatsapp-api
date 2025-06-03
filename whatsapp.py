@@ -966,21 +966,26 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id, sender_id, message_text = extract_message_info(message)
 
-                        # Block if pending terms
+                        # ✅ If user has not accepted terms, block normal messages
                         if sender_id in terms_pending_users:
-                            send_whatsapp_message(sender_id, "📜 Please accept the Terms of Service to proceed.")
-                            continue
+                            if "interactive" not in message:
+                                send_whatsapp_message(sender_id, "📜 Please accept the Terms of Service to proceed.")
+                                continue
 
-                        if not is_valid_message(sender_id, message_id, message_text):
-                            continue
-
-                        if handle_media_upload(message, sender_id, message_text):
-                            continue
-
+                        # ✅ Handle button replies (including accept_terms / reject_terms)
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
                             continue
 
+                        # ✅ Prevent processing duplicate or invalid messages
+                        if not is_valid_message(sender_id, message_id, message_text):
+                            continue
+
+                        # ✅ Handle media uploads
+                        if handle_media_upload(message, sender_id, message_text):
+                            continue
+
+                        # ✅ Commands
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
                             continue
@@ -988,8 +993,6 @@ def process_webhook(data):
                         if message_text.lower() == "/done":
                             handle_done_command(sender_id)
                             continue
-                            
-
 
                         if message_text.lower() == "/list_uploads":
                             handle_list_uploads(sender_id)
@@ -1003,6 +1006,7 @@ def process_webhook(data):
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
 
+                        # ✅ Fetch user status and property info
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
 
@@ -1010,13 +1014,15 @@ def process_webhook(data):
                             send_whatsapp_message(sender_id, "⚠️ User not found. Please register.")
                             continue
 
-                        property = user_info[0]["property_id"]
-                        if user_status[0]["last_action"] == "awaiting_category":
+                        property_id = user_info[0]["property_id"]
+                        last_action = user_status[0]["last_action"]
+
+                        if last_action == "awaiting_category":
                             handle_category_selection(sender_id, message_text)
                             continue
 
-                        if user_status[0]["last_action"] == "awaiting_issue_description":
-                            handle_ticket_creation(sender_id, message_text, property)
+                        if last_action == "awaiting_issue_description":
+                            handle_ticket_creation(sender_id, message_text, property_id)
                             continue
 
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
