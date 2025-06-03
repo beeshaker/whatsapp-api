@@ -86,22 +86,22 @@ def send_category_prompt(to):
 
 
     
-def reset_category_selection(to):
-    """Resets the category selection if the user takes more than 5 minutes to respond."""
-    time.sleep(300)  # Wait for 5 minutes
-
+def reset_category_selection(to: str):
+    time.sleep(300)  # 5 minutes
     with user_timers_lock:
         last_attempt_time = user_timers.get(to)
-        if last_attempt_time:
-            elapsed_time = (datetime.now() - last_attempt_time).total_seconds()
-            if elapsed_time >= 300:
-                del user_timers[to]  # Safe to delete while lock is held
-            else:
-                return  # Exit early if not expired
-        else:
-            return  # Exit early if already cleared
+        if not last_attempt_time:
+            return
+        elapsed_time = (datetime.now() - last_attempt_time).total_seconds()
+        if elapsed_time < 300:
+            return
+        del user_timers[to]
 
-    # Actions that don’t require the lock (outside the lock)
+    user_info = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (to,))
+    if user_info and user_info[0]["last_action"] != "awaiting_category":
+        logging.info(f"Skipping reset for {to}: last_action={user_info[0]['last_action']}")
+        return
+
     logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
     query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
     send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
@@ -759,20 +759,27 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
     if ticket_check and (datetime.now() - ticket_check[0]["created_at"]).total_seconds() < 60:
         executor.submit(send_whatsapp_message, sender_id, "🛑 You've recently created a ticket. Please wait a minute before creating another.")
         return
+
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
+
     with media_buffer_lock:
         media_list = media_buffer.get(sender_id, []).copy()
-        if sender_id in media_buffer:
+        if not media_list:
+            logging.warning(f"No media found for sender {sender_id} during ticket creation.")
+        else:
+            for entry in media_list:
+                save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+                logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
             del media_buffer[sender_id]
-    for entry in media_list:
-        save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-        logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
+
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
     )
+
     executor.submit(send_whatsapp_message, sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!")
+
     with user_timers_lock:
         if sender_id in upload_state:
             if upload_state[sender_id]["timer"]:
@@ -781,6 +788,37 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
 
 
 
+
+def handle_done_command(sender_id):
+    user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+
+    with media_buffer_lock:
+        attachments = media_buffer.get(sender_id, [])
+
+    logging.info(f"Processing /done for {sender_id}: {len(attachments)} attachments found")
+
+    # Cancel any existing upload timer
+    with user_timers_lock:
+        if sender_id in upload_state and upload_state[sender_id]["timer"]:
+            upload_state[sender_id]["timer"].cancel()
+            upload_state[sender_id]["timer"] = None
+            logging.info(f"Cancelled upload timer for {sender_id}")
+
+    # Handle case with no attachments
+    if not attachments:
+        executor.submit(send_whatsapp_message, sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
+    else:
+        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {len(attachments)} file(s). Please describe your issue to proceed.")
+
+    # Check category and update user state
+    if user_data and user_data[0]["temp_category"]:
+        query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        if not attachments:
+            executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
+    else:
+        query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        executor.submit(send_whatsapp_message, sender_id, "⚠️ Please select a category first.")
+        executor.submit(send_category_prompt, sender_id)
 
     
 def handle_clear_attachments(sender_id):
@@ -793,21 +831,21 @@ def handle_clear_attachments(sender_id):
             executor.submit(send_whatsapp_message, sender_id, "📎 You have no pending attachments.")
         
         
-def handle_category_selection(sender_id, message_text):
+def handle_category_selection(sender_id: str, message_text: str):
     category_name = get_category_name(message_text)
     if category_name:
         query_database(
             "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
-            (category_name, sender_id),
-            commit=True
+            (category_name, sender_id), commit=True
         )
-        executor.submit(send_whatsapp_message, sender_id, "Please describe your issue, or upload a supporting file.")
         with user_timers_lock:
             if sender_id in user_timers:
                 del user_timers[sender_id]
+                logging.info(f"Cancelled category selection timer for {sender_id}")
+        send_whatsapp_message(sender_id, "Please describe your issue or upload a supporting file.")
     else:
-        executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣ or 4️⃣.")
-        executor.submit(send_category_prompt, sender_id)
+        send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
+        send_category_prompt(sender_id)
         
         
 def handle_ticket_creation(sender_id, message_text, property):
@@ -936,35 +974,9 @@ def process_webhook(data):
                             continue
 
                         if message_text.lower() == "/done":
-                            user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-                            with media_buffer_lock:
-                                attachments = media_buffer.get(sender_id, [])
-                            logging.info(f"Processing /done for {sender_id}: {len(attachments)} attachments found")
-                            
-                            # Cancel any existing upload timer
-                            with user_timers_lock:
-                                if sender_id in upload_state and upload_state[sender_id]["timer"]:
-                                    upload_state[sender_id]["timer"].cancel()
-                                    upload_state[sender_id]["timer"] = None
-                                    logging.info(f"Cancelled upload timer for {sender_id}")
-
-                            # Handle case with no attachments
-                            if not attachments:
-                                send_whatsapp_message(sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
-                            else:
-                                # Confirm number of attachments
-                                send_whatsapp_message(sender_id, f"📎 You've uploaded {len(attachments)} file(s). Please describe your issue to proceed.")
-
-                            # Check category and update user state
-                            if user_data and user_data[0]["temp_category"]:
-                                query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-                                if not attachments:  # Only send description prompt if no attachments message was sent
-                                    send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
-                            else:
-                                query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-                                send_whatsapp_message(sender_id, "⚠️ Please select a category first.")
-                                send_category_prompt(sender_id)
+                            handle_done_command(sender_id)
                             continue
+                            
 
 
                         if message_text.lower() == "/list_uploads":
