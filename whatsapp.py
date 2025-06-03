@@ -940,13 +940,35 @@ def process_webhook(data):
 
                         if message_text.lower() == "/done":
                             user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+                            with media_buffer_lock:
+                                attachments = media_buffer.get(sender_id, [])
+                            logging.info(f"Processing /done for {sender_id}: {len(attachments)} attachments found")
+                            
+                            # Cancel any existing upload timer
+                            with user_timers_lock:
+                                if sender_id in upload_state and upload_state[sender_id]["timer"]:
+                                    upload_state[sender_id]["timer"].cancel()
+                                    upload_state[sender_id]["timer"] = None
+                                    logging.info(f"Cancelled upload timer for {sender_id}")
+
+                            # Handle case with no attachments
+                            if not attachments:
+                                send_whatsapp_message(sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
+                            else:
+                                # Confirm number of attachments
+                                send_whatsapp_message(sender_id, f"📎 You've uploaded {len(attachments)} file(s). Please describe your issue to proceed.")
+
+                            # Check category and update user state
                             if user_data and user_data[0]["temp_category"]:
                                 query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-                                send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
+                                if not attachments:  # Only send description prompt if no attachments message was sent
+                                    send_whatsapp_message(sender_id, "✏️ Great! Please describe your issue.")
                             else:
                                 query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+                                send_whatsapp_message(sender_id, "⚠️ Please select a category first.")
                                 send_category_prompt(sender_id)
                             continue
+
 
                         if message_text.lower() == "/list_uploads":
                             handle_list_uploads(sender_id)
