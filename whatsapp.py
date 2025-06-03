@@ -38,6 +38,8 @@ last_messages = {}  # { sender_id: (message_text, timestamp) }
 media_buffer = {}  # { sender_id: [{ media_type, media_path, caption, timestamp }] }
 upload_state = {}  # { sender_id: { timer, last_upload_time, media_count } }
 terms_pending_users = {}  # sender_id: timestamp
+temp_opt_in_data = {}
+
 
 
 
@@ -152,21 +154,24 @@ def opt_in_user_route():
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
+    name = data.get("name")
     whatsapp_number = data.get("whatsapp_number")
-    already_registered = query_database(
-        "SELECT id FROM users WHERE whatsapp_number = %s", (whatsapp_number,)
-    )
-    logging.info(f"Checking if {whatsapp_number} is already_registered")
+    property_id = data.get("property_id")
+    unit_number = data.get("unit_number")
 
-    if not whatsapp_number:
-        return jsonify({"error": "Missing whatsapp_number"}), 400
-    elif already_registered:
-        return jsonify({"status": "already_registered"}), 200
-    else:
-        logging.info(f"sending terms prompt for {whatsapp_number}")
+    if not all([name, whatsapp_number, property_id, unit_number]):
+        return jsonify({"error": "Missing fields"}), 400
 
-        send_terms_prompt(whatsapp_number)
-        return jsonify({"status": "terms_sent"}), 200
+    # Store user data in memory for now (one request cycle) — better: use DB if needed long-term
+    temp_opt_in_data[whatsapp_number] = {
+        "name": name,
+        "property_id": property_id,
+        "unit_number": unit_number
+    }
+
+    send_terms_prompt(whatsapp_number)
+    return jsonify({"status": "terms_sent"}), 200
+
 
 
 
@@ -581,14 +586,19 @@ def handle_button_reply(message, sender_id):
                 upload_state[sender_id]["timer"].cancel()
                 upload_state[sender_id]["timer"] = None
 
-    if button_id == "accept_terms":
-        if sender_id in terms_pending_users:
-            del terms_pending_users[sender_id]
-            query_database("INSERT INTO users (whatsapp_number) VALUES (%s)", (sender_id,), commit=True)
-            executor.submit(send_whatsapp_message, sender_id, "🎉 Thank you! You are now registered.")
-            executor.submit(send_whatsapp_buttons, sender_id)
+    elif button_id == "accept_terms":
+        user = temp_opt_in_data.get(sender_id)
+        if user:
+            query_database("""
+                INSERT INTO users (name, whatsapp_number, property_id, unit_number)
+                VALUES (%s, %s, %s, %s)
+            """, (user["name"], sender_id, user["property_id"], user["unit_number"]), commit=True)
+
+            del temp_opt_in_data[sender_id]
+            executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
         else:
-            executor.submit(send_whatsapp_message, sender_id, "⚠️ This session has expired. Please try again.")
+            executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
+
 
     elif button_id == "reject_terms":
         if sender_id in terms_pending_users:
