@@ -967,7 +967,8 @@ def process_webhook(data):
                         message_id, sender_id, message_text = extract_message_info(message)
 
                         # Log message details for debugging
-                        logging.info(f"Processing message from {sender_id}: {message_text} (ID: {message_id})")
+                        logging.info(f"Processing message from {sender_id}: '{message_text}' (ID: {message_id})")
+                        logging.debug(f"terms_pending_users state: {terms_pending_users}")
 
                         # Handle interactive button replies (e.g., accept_terms, reject_terms)
                         if "interactive" in message and "button_reply" in message["interactive"]:
@@ -975,34 +976,37 @@ def process_webhook(data):
                             continue
 
                         # Handle text-based terms acceptance for users pending registration
-                        if sender_id in terms_pending_users and message_text.lower() in ["accept", "reject"]:
-                            logging.info(f"Handling terms response for {sender_id}: {message_text}")
-                            if message_text.lower() == "accept":
-                                user = temp_opt_in_data.get(sender_id)
-                                if user:
-                                    logging.info(f"✅ Accepting terms for {sender_id}: {user}")
-                                    query_database(
-                                        """
-                                        INSERT INTO users (name, whatsapp_number, property_id, unit_number)
-                                        VALUES (%s, %s, %s, %s)
-                                        """,
-                                        (user["name"], sender_id, user["property_id"], user["unit_number"]),
-                                        commit=True
-                                    )
-                                    del temp_opt_in_data[sender_id]
-                                    del terms_pending_users[sender_id]
-                                    executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
-                                    executor.submit(send_whatsapp_buttons, sender_id)
+                        if sender_id in terms_pending_users:
+                            normalized_text = message_text.strip().lower()
+                            logging.debug(f"Normalized message text: '{normalized_text}'")
+                            if normalized_text in ["accept", "reject"]:
+                                logging.info(f"Handling terms response for {sender_id}: {normalized_text}")
+                                if normalized_text == "accept":
+                                    user = temp_opt_in_data.get(sender_id)
+                                    if user:
+                                        logging.info(f"✅ Accepting terms for {sender_id}: {user}")
+                                        query_database(
+                                            """
+                                            INSERT INTO users (name, whatsapp_number, property_id, unit_number)
+                                            VALUES (%s, %s, %s, %s)
+                                            """,
+                                            (user["name"], sender_id, user["property_id"], user["unit_number"]),
+                                            commit=True
+                                        )
+                                        del temp_opt_in_data[sender_id]
+                                        del terms_pending_users[sender_id]
+                                        executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
+                                        executor.submit(send_whatsapp_buttons, sender_id)
+                                    else:
+                                        logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
+                                        executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
                                 else:
-                                    logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
-                                    executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
-                            else:
-                                del terms_pending_users[sender_id]
-                                if sender_id in temp_opt_in_data:
-                                    del temp_opt_in_data[sender_id]
-                                executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
-                            # Exit processing for this message to avoid further checks
-                            continue
+                                    del terms_pending_users[sender_id]
+                                    if sender_id in temp_opt_in_data:
+                                        del temp_opt_in_data[sender_id]
+                                    executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
+                                # Exit to prevent further processing
+                                continue
 
                         # Validate message for registered users or skip if invalid
                         logging.info(f"Validating message for {sender_id}")
