@@ -109,43 +109,22 @@ def reset_category_selection(to: str):
     query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
     send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
     
-    
 def send_terms_prompt(sender_id):
     terms_url = os.getenv("TERMS_URL", "https://digiagekenya.com/apricot/TermsofService.html")
     privacy_url = os.getenv("PRIVACY_URL", "https://digiagekenya.com/apricot/policy.html")
 
-    message = (
-        f"📜 Before proceeding, please review our Terms of Service and Privacy Policy:\n\n"
-        f"🔗 Terms of Service: {terms_url}\n"
-        f"🔗 Privacy Policy: {privacy_url}\n\n"
-        f"Please confirm if you accept these terms."
-    )
+    # Use a pre-approved WhatsApp template for initial contact
+    template_name = "registration_welcome"  # Ensure this template is approved in WhatsApp Business API
+    template_parameters = [terms_url, privacy_url]
 
-    url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": sender_id,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": message},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "accept_terms", "title": "✅ Accept"}},
-                    {"type": "reply", "reply": {"id": "reject_terms", "title": "❌ Reject"}}
-                ]
-            }
-        }
-    }
-
-    terms_pending_users[sender_id] = time.time()
-    response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Sent terms prompt to {sender_id}: {response.json()}")
+    response = send_template_message(sender_id, template_name, template_parameters)
+    if response.get("messages"):
+        terms_pending_users[sender_id] = time.time()
+        logging.info(f"Sent terms template to {sender_id}: {response}")
+    else:
+        logging.error(f"Failed to send terms template to {sender_id}: {response}")
+        # Optionally, notify admin or retry
+        
 
 
 @app.route('/opt_in_user', methods=['POST'])
@@ -977,17 +956,48 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id, sender_id, message_text = extract_message_info(message)
 
-                        # ✅ Allow and handle interactive button replies (e.g., accept_terms)
+                        # Handle interactive button replies (e.g., accept_terms, reject_terms)
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
                             continue
 
+                        # Handle text-based terms acceptance for users pending registration
+                        if sender_id in terms_pending_users and message_text.lower() in ["accept", "reject"]:
+                            if message_text.lower() == "accept":
+                                user = temp_opt_in_data.get(sender_id)
+                                if user:
+                                    logging.info(f"✅ Accepting terms for {sender_id}: {user}")
+                                    query_database(
+                                        """
+                                        INSERT INTO users (name, whatsapp_number, property_id, unit_number)
+                                        VALUES (%s, %s, %s, %s)
+                                        """,
+                                        (user["name"], sender_id, user["property_id"], user["unit_number"]),
+                                        commit=True
+                                    )
+                                    del temp_opt_in_data[sender_id]
+                                    del terms_pending_users[sender_id]
+                                    send_whatsapp_message(sender_id, "🎉 You’ve been registered successfully!")
+                                    send_whatsapp_buttons(sender_id)
+                                else:
+                                    logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
+                                    send_whatsapp_message(sender_id, "⚠️ Something went wrong. Please try again.")
+                            else:
+                                del terms_pending_users[sender_id]
+                                if sender_id in temp_opt_in_data:
+                                    del temp_opt_in_data[sender_id]
+                                send_whatsapp_message(sender_id, "❌ You must accept the Terms to use this service.")
+                            continue
+
+                        # Validate message for registered users or skip if invalid
                         if not is_valid_message(sender_id, message_id, message_text):
                             continue
 
+                        # Handle media uploads (image, video, document)
                         if handle_media_upload(message, sender_id, message_text):
                             continue
 
+                        # Handle commands
                         if message_text.lower() == "/clear_attachments":
                             handle_clear_attachments(sender_id)
                             continue
@@ -1008,6 +1018,7 @@ def process_webhook(data):
                                 send_whatsapp_message(sender_id, "⚠️ Please provide an upload number (e.g., /remove_upload 1).")
                             continue
 
+                        # Fetch user status and info
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
 
@@ -1018,14 +1029,17 @@ def process_webhook(data):
                         property_id = user_info[0]["property_id"]
                         last_action = user_status[0]["last_action"]
 
+                        # Handle category selection
                         if last_action == "awaiting_category":
                             handle_category_selection(sender_id, message_text)
                             continue
 
+                        # Handle ticket creation
                         if last_action == "awaiting_issue_description":
                             handle_ticket_creation(sender_id, message_text, property_id)
                             continue
 
+                        # Handle menu trigger words
                         if message_text.lower() in ["hi", "hello", "help", "menu"]:
                             send_whatsapp_buttons(sender_id)
                             continue
