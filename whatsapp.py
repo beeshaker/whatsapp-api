@@ -493,14 +493,16 @@ def send_caption_confirmation(phone_number, captions, access_token, phone_number
 
 
 def is_valid_message(sender_id, message_id, message_text):
-    
+    # Allow messages from users pending terms acceptance
     if sender_id in terms_pending_users:
         logging.info(f"Pending terms: {terms_pending_users}")
+        logging.info(f"Allowing message from pending user {sender_id}")
         return True
+
     # Ignore unregistered users
     if not is_registered_user(sender_id):
-        logging.info(f"Blocked unregistered user: {sender_id}")
         logging.info(f"Pending terms: {terms_pending_users}")
+        logging.info(f"Blocked unregistered user: {sender_id}")
         send_whatsapp_message(sender_id, "You are not registered. Please register first.")
         return False
 
@@ -511,6 +513,7 @@ def is_valid_message(sender_id, message_id, message_text):
         return False
 
     mark_message_as_processed(message_id)
+    logging.info(f"Message {message_id} marked as processed for {sender_id}")
     return True
 
 
@@ -963,6 +966,9 @@ def process_webhook(data):
                     for message in change["value"]["messages"]:
                         message_id, sender_id, message_text = extract_message_info(message)
 
+                        # Log message details for debugging
+                        logging.info(f"Processing message from {sender_id}: {message_text} (ID: {message_id})")
+
                         # Handle interactive button replies (e.g., accept_terms, reject_terms)
                         if "interactive" in message and "button_reply" in message["interactive"]:
                             handle_button_reply(message, sender_id)
@@ -970,6 +976,7 @@ def process_webhook(data):
 
                         # Handle text-based terms acceptance for users pending registration
                         if sender_id in terms_pending_users and message_text.lower() in ["accept", "reject"]:
+                            logging.info(f"Handling terms response for {sender_id}: {message_text}")
                             if message_text.lower() == "accept":
                                 user = temp_opt_in_data.get(sender_id)
                                 if user:
@@ -984,20 +991,23 @@ def process_webhook(data):
                                     )
                                     del temp_opt_in_data[sender_id]
                                     del terms_pending_users[sender_id]
-                                    send_whatsapp_message(sender_id, "🎉 You’ve been registered successfully!")
-                                    send_whatsapp_buttons(sender_id)
+                                    executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
+                                    executor.submit(send_whatsapp_buttons, sender_id)
                                 else:
                                     logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
-                                    send_whatsapp_message(sender_id, "⚠️ Something went wrong. Please try again.")
+                                    executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
                             else:
                                 del terms_pending_users[sender_id]
                                 if sender_id in temp_opt_in_data:
                                     del temp_opt_in_data[sender_id]
-                                send_whatsapp_message(sender_id, "❌ You must accept the Terms to use this service.")
+                                executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
+                            # Exit processing for this message to avoid further checks
                             continue
 
                         # Validate message for registered users or skip if invalid
+                        logging.info(f"Validating message for {sender_id}")
                         if not is_valid_message(sender_id, message_id, message_text):
+                            logging.info(f"Message validation failed for {sender_id}")
                             continue
 
                         # Handle media uploads (image, video, document)
@@ -1026,10 +1036,12 @@ def process_webhook(data):
                             continue
 
                         # Fetch user status and info
+                        logging.info(f"Fetching user status for {sender_id}")
                         user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
                         user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
 
                         if not user_info or not user_status:
+                            logging.warning(f"User not found in database for {sender_id}")
                             send_whatsapp_message(sender_id, "⚠️ User not found. Please register.")
                             continue
 
