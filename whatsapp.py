@@ -492,6 +492,9 @@ def send_caption_confirmation(phone_number, captions, access_token, phone_number
 
 
 def is_valid_message(sender_id, message_id, message_text):
+    
+    if sender_id in terms_pending_users:
+        return True
     # Ignore unregistered users
     if not is_registered_user(sender_id):
         logging.info(f"Blocked unregistered user: {sender_id}")
