@@ -145,11 +145,14 @@ def opt_in_user_route():
         return jsonify({"error": "Missing fields"}), 400
 
     logging.info(f"Storing opt-in data for {whatsapp_number}: {name}, {property_id}, {unit_number}")
+
+    # ✅ Add both temp data and pending terms state
     temp_opt_in_data[whatsapp_number] = {
         "name": name,
         "property_id": property_id,
         "unit_number": unit_number
     }
+    terms_pending_users[whatsapp_number] = True
 
     send_terms_prompt(whatsapp_number)
     return jsonify({"status": "terms_sent"}), 200
