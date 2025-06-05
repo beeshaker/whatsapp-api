@@ -121,6 +121,7 @@ def send_terms_prompt(sender_id):
     if response.get("messages"):
         terms_pending_users[sender_id] = time.time()
         logging.info(f"Sent terms template to {sender_id}: {response}")
+        logging.info(terms_pending_users)
     else:
         logging.error(f"Failed to send terms template to {sender_id}: {response}")
         # Optionally, notify admin or retry
@@ -494,15 +495,18 @@ def send_caption_confirmation(phone_number, captions, access_token, phone_number
 def is_valid_message(sender_id, message_id, message_text):
     
     if sender_id in terms_pending_users:
+        logging.info(f"Pending terms: {terms_pending_users}")
         return True
     # Ignore unregistered users
     if not is_registered_user(sender_id):
         logging.info(f"Blocked unregistered user: {sender_id}")
+        logging.info(f"Pending terms: {terms_pending_users}")
         send_whatsapp_message(sender_id, "You are not registered. Please register first.")
         return False
 
     # Skip duplicate/rapid messages
     if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
+        logging.info(f"Pending terms: {terms_pending_users}")
         logging.info(f"⚠️ Skipping duplicate message {message_id}")
         return False
 
