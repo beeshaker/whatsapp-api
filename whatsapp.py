@@ -1117,7 +1117,7 @@ def process_webhook(data):
                     base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
                     name, ext = os.path.splitext(base_filename)
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"{name}_{timestamp}{ext}")
+                    filename = f"{name}_{timestamp}{ext}"
                     download_result = download_media(media_id, filename)
                     if "success" in download_result:
                         with media_buffer_lock:
