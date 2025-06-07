@@ -968,7 +968,7 @@ def register_user(sender_id, user_info):
         logging.info(f"✅ Registered user {sender_id} with name={name}, property_id={property_id}, unit_number={unit_number}")
     except Exception as e:
         logging.error(f"❌ Failed to register user {sender_id}: {e}", exc_info=True)
-        send_whatsapp_message(sender_id, "⚠️ Registration failed. Please contact support.")
+        send_whatsapp_message(sender_id, f"⚠️ Registration failed. Please contact support. error code: {e}")
 
 
 
