@@ -971,17 +971,11 @@ def register_user(sender_id, user_info):
         send_whatsapp_message(sender_id, f"⚠️ Registration failed. Please contact support. error code: {e}")
 
 
-
-    
-import threading
-import logging
-from threading import Timer
-from conn1 import get_db_connection1
-from sqlalchemy.sql import text
-
 def handle_accept(sender_id):
     with accept_lock:
         logging.info(f"Processing accept for {sender_id}")
+        # Log the current state of temp_opt_in_data
+        logging.info(f"Current temp_opt_in_data: {temp_opt_in_data}")
         # Send immediate "please wait" message
         send_whatsapp_message(sender_id, "⏳ We're getting things sorted, this may take a minute or two...")
 
@@ -1003,6 +997,8 @@ def handle_accept(sender_id):
         def try_register(attempt):
             with accept_lock:
                 logging.info(f"🔁 Attempt {attempt} to register {sender_id}")
+                # Log temp_opt_in_data during retry attempt
+                logging.info(f"temp_opt_in_data during attempt {attempt}: {temp_opt_in_data}")
                 if is_registered_user(sender_id):
                     logging.info(f"User {sender_id} already registered during retry, skipping.")
                     with terms_pending_lock:
@@ -1042,7 +1038,6 @@ def handle_accept(sender_id):
         timer = Timer(15, try_register, args=[1])
         accept_retry_state[sender_id] = {"attempt": 1, "timer": timer}
         timer.start()
-
 
 
 def extract_message_info(message):
