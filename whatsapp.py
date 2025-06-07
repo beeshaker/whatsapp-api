@@ -152,7 +152,7 @@ def opt_in_user_route():
         "property_id": property_id,
         "unit_number": unit_number
     }
-    terms_pending_users[whatsapp_number] = True
+    terms_pending_users[whatsapp_number] = time.time()
 
     send_terms_prompt(whatsapp_number)
     return jsonify({"status": "terms_sent"}), 200
@@ -1008,7 +1008,8 @@ def process_webhook(data):
                 # Handle TOS acceptance
                 if normalized in ["accept", "reject"]:
                     with terms_pending_lock:
-                        if sender_id in terms_pending_users:
+                        if sender_id in terms_pending_users or sender_id in temp_opt_in_data:
+
                             if normalized == "accept":
                                 user = temp_opt_in_data.get(sender_id)
                                 if user:
@@ -1022,20 +1023,23 @@ def process_webhook(data):
                                         del terms_pending_users[sender_id]
                                         executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
                                         executor.submit(send_whatsapp_buttons, sender_id)
-                                        continue
                                     except Exception as e:
-                                        logging.error(f"DB Insert failed for {sender_id}: {e}")
+                                        logging.error(f"❌ DB Insert failed for {sender_id}: {e}")
                                         executor.submit(send_whatsapp_message, sender_id, "⚠️ Registration failed. Try again.")
-                                        continue
                                 else:
+                                    logging.warning(f"⚠️ Accept received but no opt-in data found for {sender_id}")
                                     executor.submit(send_whatsapp_message, sender_id, "⚠️ Missing registration data. Try again.")
                             else:
+                                # Reject
+                                logging.info(f"❌ {sender_id} rejected the terms.")
                                 del terms_pending_users[sender_id]
                                 temp_opt_in_data.pop(sender_id, None)
                                 executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
                         else:
+                            logging.warning(f"⚠️ Terms reply from {sender_id} ignored — no pending registration.")
                             executor.submit(send_whatsapp_message, sender_id, "⚠️ Please contact support to register.")
                     continue
+
 
                 # Validate message
                 if not is_valid_message(sender_id, message_id, message_text):
