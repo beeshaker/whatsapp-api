@@ -594,14 +594,7 @@ def handle_button_reply(message, sender_id):
         try:
             user = temp_opt_in_data.get(sender_id)
             if user:
-                logging.info(f"✅ Accepting terms for {sender_id}: {user}")
-                query_database("""
-                    INSERT INTO users (name, whatsapp_number, property_id, unit_number)
-                    VALUES (%s, %s, %s, %s)
-                """, (user["name"], sender_id, user["property_id"], user["unit_number"]), commit=True)
-
-                del temp_opt_in_data[sender_id]
-                executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
+                executor.submit(handle_accept, sender_id)
             else:
                 logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
                 executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
@@ -942,13 +935,12 @@ def register_user(sender_id, user_info):
         with get_db_connection1().connect() as conn:
             # Insert user if not exists
             query = text("""
-                INSERT INTO users (whatsapp_number, name, property_id, last_action, registration_timestamp)
+                INSERT INTO users (whatsapp_number, name, property_id, last_action)
                 VALUES (:phone, :name, :property_id, 'main_menu', NOW())
                 ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
                     property_id = VALUES(property_id),
-                    last_action = 'main_menu',
-                    registration_timestamp = NOW()
+                    last_action = 'main_menu'
             """)
             conn.execute(query, {
                 "phone": sender_id,
