@@ -61,7 +61,10 @@ def insert_ticket_and_get_id(user_id, description, category, property):
 
 
 
-def (whatsapp_number):
+def mark_user_accepted_via_temp_table(whatsapp_number):
+
+    
+
     engine = get_db_connection1()
     with engine.connect() as conn:
         user = conn.execute(text("""
