@@ -58,3 +58,30 @@ def insert_ticket_and_get_id(user_id, description, category, property):
         result = conn.execute(select_query).fetchone()
         conn.commit()
         return result[0]
+
+
+
+def (whatsapp_number):
+    engine = get_db_connection1()
+    with engine.connect() as conn:
+        user = conn.execute(text("""
+            SELECT name, property_id, unit_number FROM temp_opt_in_users
+            WHERE whatsapp_number = :num
+        """), {"num": whatsapp_number}).fetchone()
+
+        if not user:
+            raise Exception("User not found in temp_opt_in_users")
+
+        conn.execute(text("""
+            INSERT INTO users (name, whatsapp_number, property_id, unit_number, terms_accepted, terms_accepted_at)
+            VALUES (:name, :whatsapp_number, :property_id, :unit_number, 1, NOW())
+            ON DUPLICATE KEY UPDATE terms_accepted = 1, terms_accepted_at = NOW()
+        """), {
+            "name": user["name"],
+            "whatsapp_number": whatsapp_number,
+            "property_id": user["property_id"],
+            "unit_number": user["unit_number"]
+        })
+
+        conn.execute(text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"), {"num": whatsapp_number})
+        conn.commit()
