@@ -40,6 +40,9 @@ media_buffer = {}  # { sender_id: [{ media_type, media_path, caption, timestamp 
 upload_state = {}  # { sender_id: { timer, last_upload_time, media_count } }
 terms_pending_users = {}  # sender_id: timestamp
 temp_opt_in_data = {}
+# Tracks retry attempts and timer objects per user
+accept_retry_state = {}  # { sender_id: { 'attempt': int, 'timer': Timer } }
+
 
 
 
@@ -928,10 +931,88 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     with user_timers_lock:
         if sender_id in user_timers:
             del user_timers[sender_id]
+            
+            
+def register_user(sender_id, user_info):
+    try:
+        # Extract required info
+        name = user_info.get("name")
+        property_id = user_info.get("property_id")
+
+        with get_db_connection1().connect() as conn:
+            # Insert user if not exists
+            query = text("""
+                INSERT INTO users (whatsapp_number, name, property_id, last_action, registration_timestamp)
+                VALUES (:phone, :name, :property_id, 'main_menu', NOW())
+                ON DUPLICATE KEY UPDATE
+                    name = VALUES(name),
+                    property_id = VALUES(property_id),
+                    last_action = 'main_menu',
+                    registration_timestamp = NOW()
+            """)
+            conn.execute(query, {
+                "phone": sender_id,
+                "name": name,
+                "property_id": property_id
+            })
+
+        # Clean up user from terms list
+        if sender_id in terms_pending_users:
+            terms_pending_users.remove(sender_id)
+
+        logging.info(f"✅ Registered user {sender_id} with name={name} and property_id={property_id}")
+
+    except Exception as e:
+        logging.error(f"❌ Failed to register user {sender_id}: {e}")
+        send_whatsapp_message(sender_id, "⚠️ Registration failed. Please contact support.")
+
 
 
     
-    
+def handle_accept(sender_id):
+    if sender_id not in temp_opt_in_data:
+        if sender_id in terms_pending_users:
+
+            send_whatsapp_message(sender_id, "⏳ We're getting things ready. Please wait...")
+
+            def retry_accept(attempt):
+                logging.info(f"🔁 Retry attempt {attempt} for {sender_id}")
+
+                if sender_id in temp_opt_in_data:
+                    user_info = temp_opt_in_data.pop(sender_id)
+                    register_user(sender_id, user_info)
+                    send_whatsapp_message(sender_id, "🎉 You've been registered successfully!")
+                    if sender_id in accept_retry_state:
+                        accept_retry_state.pop(sender_id)
+                    return
+
+                if attempt < 4:
+                    timer = Timer(15, retry_accept, args=[attempt + 1])
+                    accept_retry_state[sender_id] = {"attempt": attempt + 1, "timer": timer}
+                    timer.start()
+                else:
+                    send_whatsapp_message(sender_id, "⚠️ Still not ready. Please try typing 'Accept' again in a moment.")
+                    if sender_id in accept_retry_state:
+                        accept_retry_state.pop(sender_id)
+
+            # Initial delay of 15s
+            timer = Timer(15, retry_accept, args=[1])
+            accept_retry_state[sender_id] = {"attempt": 1, "timer": timer}
+            timer.start()
+
+        else:
+            send_whatsapp_message(sender_id, "⚠️ Please contact support to register.")
+        return
+
+    # If data is ready immediately
+    user_info = temp_opt_in_data.pop(sender_id)
+    register_user(sender_id, user_info)
+    send_whatsapp_message(sender_id, "🎉 You've been registered successfully!")
+    if sender_id in accept_retry_state:
+        accept_retry_state.pop(sender_id)
+
+
+
 def extract_message_info(message):
     """
     Extracts message ID, sender ID, and message text (or caption) from a WhatsApp message.
@@ -1008,37 +1089,56 @@ def process_webhook(data):
                 # Handle TOS acceptance
                 if normalized in ["accept", "reject"]:
                     with terms_pending_lock:
-                        if sender_id in terms_pending_users or sender_id in temp_opt_in_data:
+                        if normalized == "reject":
+                            # ❌ User rejected terms
+                            temp_opt_in_data.pop(sender_id, None)
+                            terms_pending_users.pop(sender_id, None)
+                            executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
+                            continue
 
-                            if normalized == "accept":
-                                user = temp_opt_in_data.get(sender_id)
-                                if user:
-                                    try:
-                                        query_database(
-                                            "INSERT INTO users (name, whatsapp_number, property_id, unit_number) VALUES (%s, %s, %s, %s)",
-                                            (user["name"], sender_id, user["property_id"], user["unit_number"]),
-                                            commit=True
-                                        )
-                                        del temp_opt_in_data[sender_id]
-                                        del terms_pending_users[sender_id]
-                                        executor.submit(send_whatsapp_message, sender_id, "🎉 You’ve been registered successfully!")
-                                        executor.submit(send_whatsapp_buttons, sender_id)
-                                    except Exception as e:
-                                        logging.error(f"❌ DB Insert failed for {sender_id}: {e}")
-                                        executor.submit(send_whatsapp_message, sender_id, "⚠️ Registration failed. Try again.")
-                                else:
-                                    logging.warning(f"⚠️ Accept received but no opt-in data found for {sender_id}")
-                                    executor.submit(send_whatsapp_message, sender_id, "⚠️ Missing registration data. Try again.")
+                        # Cancel any existing retry if the user retypes "accept"
+                        if sender_id in accept_retry_state:
+                            retry_info = accept_retry_state.pop(sender_id)
+                            retry_info["timer"].cancel()
+                            logging.info(f"🛑 Retry cancelled for {sender_id} due to new Accept input.")
+
+                        # ✅ Handle Accept
+                        if sender_id not in temp_opt_in_data:
+                            if sender_id in terms_pending_users:
+                                executor.submit(send_whatsapp_message, sender_id, "⏳ We're getting things ready. Please wait...")
+
+                                def retry_accept(attempt):
+                                    logging.info(f"🔁 Retry attempt {attempt} for {sender_id}")
+
+                                    if sender_id in temp_opt_in_data:
+                                        user_info = temp_opt_in_data.pop(sender_id)
+                                        register_user(sender_id, user_info)
+                                        executor.submit(send_whatsapp_message, sender_id, "🎉 You've been registered successfully!")
+                                        accept_retry_state.pop(sender_id, None)
+                                        return
+
+                                    if attempt < 4:
+                                        timer = Timer(15, retry_accept, args=[attempt + 1])
+                                        accept_retry_state[sender_id] = {"attempt": attempt + 1, "timer": timer}
+                                        timer.start()
+                                    else:
+                                        executor.submit(send_whatsapp_message, sender_id, "⚠️ Still not ready. Please type 'Accept' again.")
+                                        accept_retry_state.pop(sender_id, None)
+
+                                # Start retry loop
+                                timer = Timer(15, retry_accept, args=[1])
+                                accept_retry_state[sender_id] = {"attempt": 1, "timer": timer}
+                                timer.start()
                             else:
-                                # Reject
-                                logging.info(f"❌ {sender_id} rejected the terms.")
-                                del terms_pending_users[sender_id]
-                                temp_opt_in_data.pop(sender_id, None)
-                                executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
-                        else:
-                            logging.warning(f"⚠️ Terms reply from {sender_id} ignored — no pending registration.")
-                            executor.submit(send_whatsapp_message, sender_id, "⚠️ Please contact support to register.")
-                    continue
+                                executor.submit(send_whatsapp_message, sender_id, "⚠️ Please contact support to register.")
+                            continue
+
+                        # 🎉 If temp data is available, register immediately
+                        user_info = temp_opt_in_data.pop(sender_id)
+                        register_user(sender_id, user_info)
+                        executor.submit(send_whatsapp_message, sender_id, "🎉 You've been registered successfully!")
+                        accept_retry_state.pop(sender_id, None)
+                        continue
 
 
                 # Validate message
