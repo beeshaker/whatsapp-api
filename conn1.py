@@ -80,10 +80,9 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
             VALUES (:name, :whatsapp_number, :property_id, :unit_number, 1, NOW())
             ON DUPLICATE KEY UPDATE terms_accepted = 1, terms_accepted_at = NOW()
         """), {
-            "name": user["name"],
-            "whatsapp_number": whatsapp_number,
-            "property_id": user["property_id"],
-            "unit_number": user["unit_number"]
+            "name": user[0],
+            "property_id": user[1],
+            "unit_number": user[2]
         })
 
         conn.execute(text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"), {"num": whatsapp_number})
