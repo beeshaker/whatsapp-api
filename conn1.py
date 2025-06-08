@@ -2,6 +2,7 @@ from sqlalchemy import create_engine
 import os
 from dotenv import load_dotenv
 from sqlalchemy.sql import text
+import logging
 
 
 load_dotenv()
@@ -62,30 +63,45 @@ def insert_ticket_and_get_id(user_id, description, category, property):
 
 
 def mark_user_accepted_via_temp_table(whatsapp_number):
-
-    
+    """
+    Moves a user from temp_opt_in_users to users table, and marks terms as accepted.
+    If the user already exists, updates their terms_accepted status and timestamp.
+    """
 
     engine = get_db_connection1()
     with engine.connect() as conn:
-        user = conn.execute(text("""
-            SELECT name, property_id, unit_number FROM temp_opt_in_users
-            WHERE whatsapp_number = :num
-        """), {"num": whatsapp_number}).fetchone()
+        try:
+            # Step 1: Fetch user info from temporary table
+            user = conn.execute(text("""
+                SELECT name, property_id, unit_number FROM temp_opt_in_users
+                WHERE whatsapp_number = :num
+            """), {"num": whatsapp_number}).fetchone()
 
-        if not user:
-            raise Exception("User not found in temp_opt_in_users")
+            if not user:
+                raise Exception(f"User {whatsapp_number} not found in temp_opt_in_users")
 
-        conn.execute(text("""
-            INSERT INTO users (name, whatsapp_number, property_id, unit_number, terms_accepted, terms_accepted_at)
-            VALUES (:name, :whatsapp_number, :property_id, :unit_number, 1, NOW())
-            ON DUPLICATE KEY UPDATE terms_accepted = 1, terms_accepted_at = NOW()
-        """), {
-            "name": user[0],
-            "whatsapp_number": whatsapp_number,
-            "property_id": user[1],
-            "unit_number": user[2]
-        })
+            name, property_id, unit_number = user[0], user[1], user[2]
 
+            # Step 2: Insert or update the user in the main users table
+            conn.execute(text("""
+                INSERT INTO users (name, whatsapp_number, property_id, unit_number, terms_accepted, terms_accepted_at)
+                VALUES (:name, :whatsapp_number, :property_id, :unit_number, 1, NOW())
+                ON DUPLICATE KEY UPDATE terms_accepted = 1, terms_accepted_at = NOW()
+            """), {
+                "name": name,
+                "whatsapp_number": whatsapp_number,
+                "property_id": property_id,
+                "unit_number": unit_number
+            })
 
-        conn.execute(text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"), {"num": whatsapp_number})
-        conn.commit()
+            # Step 3: Delete from the temp table
+            conn.execute(text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"), {"num": whatsapp_number})
+
+            # Step 4: Commit the transaction
+            conn.commit()
+
+            logging.info(f"✅ Successfully registered and marked terms accepted for user {whatsapp_number}")
+
+        except Exception as e:
+            logging.error(f"❌ Error while registering user {whatsapp_number}: {e}")
+            raise
