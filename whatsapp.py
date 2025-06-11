@@ -413,6 +413,7 @@ def download_media(media_id, filename=None):
 
 
 def purge_expired_media():
+    
     now = time.time()
     with media_buffer_lock:
         for wa_id, media_list in list(media_buffer.items()):
@@ -427,14 +428,18 @@ def purge_expired_media():
 def purge_expired_items():
     now = time.time()
 
-    # Purge expired media uploads (5-minute TTL)
+    # Purge expired media uploads (15-minute TTL)
     with media_buffer_lock:
         for wa_id, media_list in list(media_buffer.items()):
-            fresh_media = [entry for entry in media_list if now - entry["timestamp"] < 300]
+            fresh_media = [entry for entry in media_list if now - entry["timestamp"] < MEDIA_TTL_SECONDS]
+            expired_count = len(media_list) - len(fresh_media)
+
+            if expired_count > 0:
+                logging.info(f"🗑️ Purged {expired_count} expired media item(s) for user {wa_id}")
+
             if fresh_media:
                 media_buffer[wa_id] = fresh_media
             else:
-                logging.info(f"Purging expired media for {wa_id}")
                 del media_buffer[wa_id]
                 send_whatsapp_message(wa_id, "⏳ Your uploaded files have expired. Please start again.")
 
@@ -442,11 +447,12 @@ def purge_expired_items():
     with terms_pending_lock:
         expired = [uid for uid, ts in terms_pending_users.items() if now - ts > 1800]
         for uid in expired:
-            logging.info(f"Purging expired terms prompt for {uid}")
+            logging.info(f"🗑️ Purging expired terms prompt for {uid}")
             del terms_pending_users[uid]
             if uid in temp_opt_in_data:
                 del temp_opt_in_data[uid]
             send_whatsapp_message(uid, "⏳ Your session to accept Terms expired. Please try again.")
+
 
 
         
