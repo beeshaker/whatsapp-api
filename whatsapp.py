@@ -431,6 +431,15 @@ def purge_expired_items():
     # Purge expired media uploads (15-minute TTL)
     with media_buffer_lock:
         for wa_id, media_list in list(media_buffer.items()):
+            # Skip purge if user is currently creating a ticket
+            user_state = query_database(
+                "SELECT last_action FROM users WHERE whatsapp_number = %s",
+                (wa_id,)
+            )
+            if user_state and user_state[0]["last_action"] == "creating_ticket":
+                logging.info(f"⏳ Skipping purge for {wa_id} - currently creating ticket.")
+                continue
+
             fresh_media = [entry for entry in media_list if now - entry["timestamp"] < MEDIA_TTL_SECONDS]
             expired_count = len(media_list) - len(fresh_media)
 
@@ -455,17 +464,39 @@ def purge_expired_items():
 
 
 
+
         
         
-def flush_user_media_after_ticket(sender_id, ticket_id, delay=30):
-    logging.info(f"flush media called")
-    time.sleep(delay)
+def flush_user_media_after_ticket(sender_id, ticket_id):
+    """Flushes media entries to the DB for a given user after ticket is created."""
+    logging.info(f"⏳ Flushing media for ticket #{ticket_id} by user {sender_id}")
+
+    # Mark user state as 'creating_ticket'
+    query_database(
+        "UPDATE users SET last_action = 'creating_ticket' WHERE whatsapp_number = %s",
+        (sender_id,),
+        commit=True
+    )
+
     with media_buffer_lock:
-        media_list = media_buffer.pop(sender_id, [])
-    for entry in media_list:
-        logging.info(f"Saving media for ticket_id={ticket_id}: {media_list}")
-        save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-        logging.info(f"📁 (Post-ticket) Linked {entry['media_type']} to ticket #{ticket_id}")
+        media_list = media_buffer.get(sender_id, [])
+        for entry in media_list:
+            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+            if not success:
+                logging.error(f"❌ Failed to save media for ticket #{ticket_id} from {sender_id}: {entry}")
+                send_whatsapp_message(sender_id, "⚠️ One of your attachments failed to save. Please resend if necessary.")
+
+        del media_buffer[sender_id]  # Clear after processing
+
+    # Reset user state to 'idle'
+    query_database(
+        "UPDATE users SET last_action = 'idle' WHERE whatsapp_number = %s",
+        (sender_id,),
+        commit=True
+    )
+
+    logging.info(f"✅ Media saved and flushed for ticket #{ticket_id} by user {sender_id}")
+
         
         
 
