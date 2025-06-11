@@ -16,25 +16,39 @@ def get_db_connection1():
 
 
 
+import logging
+
 def save_ticket_media(ticket_id, media_type, file_path):
-    """Saves media content (as blob) linked to a ticket in the database."""
-    engine = get_db_connection1()
+    """
+    Saves media content (as blob) linked to a ticket in the database.
+    Logs errors if file cannot be read or if database insertion fails.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            binary_content = f.read()
+    except Exception as e:
+        logging.error(f"❌ Failed to read media file {file_path}: {e}")
+        return
+
     query = """
         INSERT INTO ticket_media (ticket_id, media_type, media_path, media_blob)
         VALUES (:ticket_id, :media_type, :media_path, :media_blob)
     """
 
-    with open(file_path, "rb") as f:
-        binary_content = f.read()
+    try:
+        engine = get_db_connection1()
+        with engine.connect() as conn:
+            conn.execute(text(query), {
+                "ticket_id": ticket_id,
+                "media_type": media_type,
+                "media_path": file_path,
+                "media_blob": binary_content
+            })
+            conn.commit()
+        logging.info(f"✅ Media saved for ticket #{ticket_id}: {media_type} -> {file_path}")
+    except Exception as e:
+        logging.error(f"❌ Failed to insert media into database for ticket {ticket_id}: {e}")
 
-    with engine.connect() as conn:
-        conn.execute(text(query), {
-            "ticket_id": ticket_id,
-            "media_type": media_type,
-            "media_path": file_path,
-            "media_blob": binary_content
-        })
-        conn.commit()
 
         
         

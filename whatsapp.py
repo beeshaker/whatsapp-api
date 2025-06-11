@@ -386,10 +386,12 @@ def send_template_message(to, template_name, parameters):
 
 
 def download_media(media_id, filename=None):
+    logging.info(f"Media buffer download media: {media_buffer}")
     meta_url = f"https://graph.facebook.com/v22.0/{media_id}"
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
     media_response = requests.get(meta_url, headers=headers)
     if media_response.status_code != 200:
+        logging.info(f"Downloading media_id={media_id}, filename={filename}")
         return {"error": "Failed to fetch media URL", "details": media_response.text}
     media_url = media_response.json().get("url")
     if not media_url:
@@ -450,17 +452,14 @@ def purge_expired_items():
         
         
 def flush_user_media_after_ticket(sender_id, ticket_id, delay=30):
-    """Flushes any media uploaded shortly after ticket creation."""
+    logging.info(f"flush media called")
     time.sleep(delay)
-
     with media_buffer_lock:
         media_list = media_buffer.pop(sender_id, [])
-
     for entry in media_list:
-        media = entry["media"]
-        save_ticket_media(ticket_id, media["media_type"], media["media_path"])
-        logging.info(f"📁 (Post-ticket) Linked {media['media_type']} to ticket #{ticket_id}")
-
+        logging.info(f"Saving media for ticket_id={ticket_id}: {media_list}")
+        save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+        logging.info(f"📁 (Post-ticket) Linked {entry['media_type']} to ticket #{ticket_id}")
         
         
 
@@ -548,8 +547,8 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             media_buffer[sender_id].append({
                 "media_type": media_type,
                 "media_path": download_result["path"],
-                "caption": None,
-                "timestamp": time.time(),
+                "caption": message_text.strip() if message_text else None,
+                "timestamp": time.time()
             })
             media_count = len(media_buffer[sender_id])
 
@@ -558,29 +557,25 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             upload_state[sender_id]["media_count"] = media_count
             upload_state[sender_id]["last_upload_time"] = time.time()
 
-        # ✅ After first upload, ask user to describe the issue (don't create ticket yet)
         if media_count == 1:
             query_database(
                 "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
                 (sender_id,), commit=True
             )
             send_whatsapp_message(sender_id, "✅ File received! Please describe your issue to continue.")
-
-            # Optional reminder after 2 minutes
             def prompt_for_description_reminder(sid):
                 time.sleep(120)
                 user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sid,))
                 if user_status and user_status[0]["last_action"] == "awaiting_issue_description":
                     send_whatsapp_message(sid, "⏳ Please describe your issue so we can proceed with the ticket.")
             threading.Thread(target=prompt_for_description_reminder, args=(sender_id,), daemon=True).start()
-
         else:
             send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s).")
             manage_upload_timer(sender_id)
-
     else:
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
         logging.error(f"Failed to save {media_type}: {download_result}")
+
 
 
 def handle_button_reply(message, sender_id):
@@ -730,46 +725,7 @@ def send_done_upload_prompt(sender_id):
     logging.info(f"Sent done upload prompt to {sender_id}: {response.json()}")
 
 
-        
-        
-def handle_auto_submit_ticket(sender_id):
-    with media_buffer_lock:
-        non_empty_captions = [
-            entry["media"].get("caption")
-            for entry in media_buffer.get(sender_id, [])
-            if entry["media"].get("caption")
-        ]
-
-    if not non_empty_captions:
-        send_whatsapp_message(sender_id, "❌ No valid captions found. Please describe your issue.")
-        return
-
-    # Set default category and mark awaiting description
-    query_database(
-        "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
-        ("Other", sender_id),
-        commit=True
-    )
-
-    auto_description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(non_empty_captions)
-
-    user_info = query_database("SELECT id, property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
-    if not user_info:
-        send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
-        return
-
-    user_id = user_info[0]["id"]
-    property = user_info[0]["property_id"]
-
-    create_ticket_with_media(sender_id, user_id, "Other", property, auto_description)
-
-    with user_timers_lock:
-        if sender_id in user_timers:
-            del user_timers[sender_id]
-
-
-    
-    
+       
     
 def create_ticket_with_media(sender_id, user_id, category, property, description):
     ticket_check = query_database(
@@ -805,6 +761,7 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
             if upload_state[sender_id]["timer"]:
                 upload_state[sender_id]["timer"].cancel()
             del upload_state[sender_id]
+
 
 
 
