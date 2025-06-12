@@ -413,17 +413,24 @@ def download_media(media_id, filename=None):
 
 
 def purge_expired_media():
-    
     now = time.time()
     with media_buffer_lock:
         for wa_id, media_list in list(media_buffer.items()):
-            fresh_media = [entry for entry in media_list if now - entry["timestamp"] < MEDIA_TTL_SECONDS]
+            fresh_media = []
+            for entry in media_list:
+                age = now - entry["timestamp"]
+                logging.info(f"🕒 Media age for {wa_id}: {age:.2f}s ({entry['media_type']})")
+                if age < MEDIA_TTL_SECONDS:
+                    fresh_media.append(entry)
+
             if fresh_media:
                 media_buffer[wa_id] = fresh_media
+                logging.info(f"✅ Retained {len(fresh_media)} media items for {wa_id}")
             else:
                 del media_buffer[wa_id]
+                logging.info(f"🗑️ All media expired for {wa_id}. Clearing buffer.")
                 send_whatsapp_message(wa_id, "⏳ Your uploaded files have expired. Please start again.")
-                
+
                 
 def purge_expired_items():
     now = time.time()
@@ -881,7 +888,7 @@ def handle_ticket_creation(sender_id, message_text, property_id):
 
     if ticket_check:
         last_created = ticket_check[0]["created_at"]
-        if (datetime.now() - last_created).total_seconds() < 300:  # 5-minute cooldown
+        if (datetime.now() - last_created).total_seconds() < 30:  # 5-minute cooldown
             logging.info(f"🛑 Ticket already created recently for user {sender_id}. Skipping.")
             send_whatsapp_message(sender_id, "🛑 You recently created a ticket. Please wait before creating another.")
             return
@@ -1095,10 +1102,13 @@ def process_webhook(data):
                                 "timestamp": time.time()
                             })
                         media_count = len(media_buffer[sender_id])
+                        logging.info(f"📦 Media added for {sender_id}. Total now: {len(media_buffer[sender_id])}")                       
+                        
                         user_status = query_database(
                             "SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s",
                             (sender_id,)
                         )
+                        logging.info(f"👤 User status after media upload: {user_status}")
                         if not user_status or user_status[0]["last_action"] != "awaiting_issue_description":
                             if user_status and not user_status[0]["temp_category"]:
                                 send_whatsapp_message(sender_id, "✅ File received! Please select a category.")
