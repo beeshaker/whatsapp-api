@@ -13,11 +13,30 @@ from threading import Timer
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import re
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+
+# Create logs directory if not exists
+os.makedirs("logs", exist_ok=True)
+
+# Log file path
+log_file = "logs/app.log"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5),  # Rotate at 5MB, keep 5 files
+        logging.StreamHandler()  # Also log to console
+    ]
+)
 
 # Initialize Flask app and executor
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=10)
-logging.basicConfig(level=logging.INFO)
+
 
 # Load environment variables
 load_dotenv()
@@ -44,16 +63,9 @@ temp_opt_in_data = {}
 accept_retry_state = {}  # { sender_id: { 'attempt': int, 'timer': Timer } }
 accept_lock = threading.Lock()
 
-
-
-
-
-
-
 # In-memory storage to track processed messages
 user_timers = {}
 upload_prompt_timers = {}  # key: sender_id, value: Timer
-
 # Media buffer TTL (15 minutes)
 MEDIA_TTL_SECONDS = 900
 
