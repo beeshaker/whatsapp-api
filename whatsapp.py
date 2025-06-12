@@ -1042,15 +1042,15 @@ def add_media_to_buffer(sender_id, media_type, media_path, caption=None):
         if not media_type:
             raise ValueError("Media type is required.")
 
-        with globals.media_buffer_lock:
-            globals.media_buffer.setdefault(sender_id, []).append({
+        with media_buffer_lock:
+            media_buffer.setdefault(sender_id, []).append({
                 "media_type": media_type,
                 "media_path": media_path,
                 "caption": caption.strip() if caption else None,
                 "timestamp": time.time()
             })
 
-            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(globals.media_buffer[sender_id])}")
+            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(media_buffer[sender_id])}")
             return True
 
     except Exception as e:
