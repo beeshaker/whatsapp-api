@@ -768,15 +768,7 @@ def send_done_upload_prompt(sender_id):
 
        
     
-def create_ticket_with_media(sender_id, user_id, category, property, description):
-    ticket_check = query_database(
-        "SELECT created_at FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
-        (user_id,)
-    )
-    if ticket_check and (datetime.now() - ticket_check[0]["created_at"]).total_seconds() < 60:
-        executor.submit(send_whatsapp_message, sender_id, "🛑 You've recently created a ticket. Please wait a minute before creating another.")
-        return
-
+def create_ticket_with_media(sender_id, user_id, category, property, description):   
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
 
     with media_buffer_lock:
@@ -1043,6 +1035,27 @@ def manage_upload_timer(sender_id):
             t.start()
 
 
+def add_media_to_buffer(sender_id, media_type, media_path, caption=None):
+    try:
+        if not media_path:
+            raise ValueError("Media path is empty or missing.")
+        if not media_type:
+            raise ValueError("Media type is required.")
+
+        with globals.media_buffer_lock:
+            globals.media_buffer.setdefault(sender_id, []).append({
+                "media_type": media_type,
+                "media_path": media_path,
+                "caption": caption.strip() if caption else None,
+                "timestamp": time.time()
+            })
+
+            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(globals.media_buffer[sender_id])}")
+            return True
+
+    except Exception as e:
+        logging.error(f"❌ Failed to add media for {sender_id}: {e}", exc_info=True)
+        return False
 
 
 def process_webhook(data):
@@ -1089,19 +1102,22 @@ def process_webhook(data):
                     name, ext = os.path.splitext(base_filename)
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"{name}_{timestamp}{ext}"
+
                     download_result = download_media(media_id, filename)
                     if "success" in download_result:
-                        with media_buffer_lock:
-                            media_buffer.setdefault(sender_id, []).append({
-                                "media_type": media_type,
-                                "media_path": download_result["path"],
-                                "caption": message_text.strip() if message_text else None,
-                                "timestamp": time.time()
-                            })
-                        logging.info(f"After append for {sender_id}: {media_buffer.get(sender_id, [])}")
-                        media_count = len(media_buffer[sender_id])
-                        logging.info(f"📦 Media added for {sender_id}. Total now: {len(media_buffer[sender_id])}")                       
-                        
+                        success = add_media_to_buffer(
+                            sender_id=sender_id,
+                            media_type=media_type,
+                            media_path=download_result["path"],
+                            caption=message_text
+                        )
+
+                        if not success:
+                            send_whatsapp_message(sender_id, f"❌ Failed to save your {media_type}. Please try again.")
+                            continue
+
+                        media_count = len(media_buffer.get(sender_id, []))
+
                         user_status = query_database(
                             "SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s",
                             (sender_id,)
@@ -1123,8 +1139,9 @@ def process_webhook(data):
                         continue
                     else:
                         logging.error(f"Media download failed: {download_result}")
-                        send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Try again.")
+                        send_whatsapp_message(sender_id, f"❌ Failed to download your {media_type}. Try again.")
                     continue
+                
                 # Command handling
                 if normalized == "/clear_attachments":
                     handle_clear_attachments(sender_id)
