@@ -335,7 +335,8 @@ def webhook():
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
 
     # ✅ Process inline to prevent duplicate processing
-    executor.submit(process_webhook(data))
+    executor.submit(process_webhook, data)  # <- correct: submit the function + argument
+
 
     return jsonify({"status": "received"}), 200
 
