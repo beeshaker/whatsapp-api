@@ -855,7 +855,7 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             media_buffer[sender_id] = remaining
             logging.info(f"♻️ Remaining media retained for {sender_id}")
         else:
-            media_buffer.pop(sender_id, None)
+            #media_buffer.pop(sender_id, None)
             logging.info(f"🧹 Cleared media buffer for {sender_id}")
 
     # Reset flow state
@@ -987,27 +987,6 @@ def manage_upload_timer(sender_id):
             t.start()
 
 
-def add_media_to_buffer(sender_id, media_type, media_path, caption=None):
-    try:
-        if not media_path:
-            raise ValueError("Media path is empty or missing.")
-        if not media_type:
-            raise ValueError("Media type is required.")
-
-        with media_buffer_lock:
-            media_buffer.setdefault(sender_id, []).append({
-                "media_type": media_type,
-                "media_path": media_path,
-                "caption": caption.strip() if caption else None,
-                "timestamp": time.time()
-            })
-
-            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(media_buffer[sender_id])}")
-            return True
-
-    except Exception as e:
-        logging.error(f"❌ Failed to add media for {sender_id}: {e}", exc_info=True)
-        return False
 
 
 def process_webhook(data):
@@ -1057,7 +1036,7 @@ def process_webhook(data):
 
                     download_result = download_media(media_id, filename)
                     if "success" in download_result:
-                        success = add_media_to_buffer(
+                        success = process_media_upload(
                             sender_id=sender_id,
                             media_type=media_type,
                             media_path=download_result["path"],
