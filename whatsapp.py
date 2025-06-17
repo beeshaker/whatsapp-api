@@ -480,7 +480,7 @@ def flush_user_media_after_ticket(sender_id, ticket_id):
                 logging.error(f"❌ Failed to save media for ticket #{ticket_id} from {sender_id}: {entry}")
                 send_whatsapp_message(sender_id, "⚠️ One of your attachments failed to save. Please resend if necessary.")
 
-        del media_buffer[sender_id]  # Clear after processing
+        #del media_buffer[sender_id]  # Clear after processing
 
     # Reset user state to 'idle'
     query_database(
@@ -685,7 +685,8 @@ def handle_button_reply(message, sender_id):
         executor.submit(send_whatsapp_message, sender_id, "📝 Please upload the files again with corrected captions.")
         with media_buffer_lock:
             if sender_id in media_buffer:
-                del media_buffer[sender_id]
+                #del media_buffer[sender_id]
+                pass
         with user_timers_lock:
             if sender_id in upload_state:
                 upload_state[sender_id]["media_count"] = 0
@@ -728,7 +729,8 @@ def handle_remove_upload(sender_id, upload_index):
                 removed = media_buffer[sender_id].pop(index)
                 executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
                 if not media_buffer[sender_id]:
-                    del media_buffer[sender_id]
+                    #del media_buffer[sender_id]
+                    pass
             else:
                 executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
     except ValueError:
@@ -774,13 +776,15 @@ def create_ticket_with_media(sender_id, user_id, category, property, description
 
     with media_buffer_lock:
         media_list = list(media_buffer.get(sender_id, []))
+        logging.info(f"📎 Media buffer before filtering for {sender_id}: {media_list}")
+
         if not media_list:
             logging.warning(f"No media found for sender {sender_id} during ticket creation.")
         else:
             for entry in media_list:
                 save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
                 logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
-            del media_buffer[sender_id]
+            #del media_buffer[sender_id]
 
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
@@ -836,7 +840,7 @@ def handle_clear_attachments(sender_id):
     with media_buffer_lock:
         if sender_id in media_buffer:
             count = len(media_buffer[sender_id])
-            del media_buffer[sender_id]
+            #del media_buffer[sender_id]
             executor.submit(send_whatsapp_message, sender_id, f"🗑️ Cleared {count} pending attachment(s).")
         else:
             executor.submit(send_whatsapp_message, sender_id, "📎 You have no pending attachments.")
