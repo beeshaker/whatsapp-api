@@ -902,16 +902,26 @@ def handle_ticket_creation(sender_id, message_text, property_id):
 
     with media_buffer_lock:
         media_list = media_buffer.get(sender_id, []).copy()
-        now = time.time()
-        recent_media = [entry for entry in media_list if now - entry["timestamp"] < 300]  # 5-minute window
-        if not recent_media:
-            logging.warning(f"No recent media found for sender {sender_id} during ticket creation.")
+
+        if not media_list:
+            logging.warning(f"No media found for sender {sender_id} during ticket creation.")
+            recent_media = []
+        else:
+            now = time.time()
+            # If needed, make the cutoff more forgiving (e.g., 10 minutes)
+            recent_media = [entry for entry in media_list if now - entry["timestamp"] < 600]
+
         for entry in recent_media:
             save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
             logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
-        media_buffer[sender_id] = [entry for entry in media_list if entry not in recent_media]
-        if not media_buffer[sender_id]:
-            del media_buffer[sender_id]
+
+        # Clean up buffer
+        remaining = [entry for entry in media_list if entry not in recent_media]
+        if remaining:
+            media_buffer[sender_id] = remaining
+        else:
+            media_buffer.pop(sender_id, None)
+
 
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
