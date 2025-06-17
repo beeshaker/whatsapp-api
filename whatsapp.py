@@ -558,7 +558,7 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
             media_buffer[sender_id].append({
                 "media_type": media_type,
                 "media_path": download_result["path"],
-                "caption": message_text.strip() if message_text else None,
+                "caption": message_text.strip() if message_text else "No Caption",
                 "timestamp": time.time()
             })
             media_count = len(media_buffer[sender_id])
@@ -993,7 +993,7 @@ def manage_upload_timer(sender_id):
 
 def process_webhook(data):
     """Processes incoming WhatsApp messages from Meta Webhook."""
-    purge_expired_items()
+    
     logging.info(f"Processing webhook data:\n{json.dumps(data, indent=2)}")
 
     if "entry" not in data:
@@ -1076,3 +1076,4 @@ def process_webhook(data):
                     send_whatsapp_buttons(sender_id)
                 else:
                     send_whatsapp_message(sender_id, "🤖 Sorry, I didn't understand that. Please choose an option from the menu.")
+    purge_expired_items()
