@@ -584,7 +584,6 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
         else:
             send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s).")
             manage_upload_timer(sender_id)
-
     else:
         logging.error(f"❌ Download failed for {sender_id}: {download_result}")
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
@@ -675,9 +674,13 @@ def handle_media_upload(message, sender_id, message_text):
         name, ext = os.path.splitext(base_filename)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{name}_{timestamp}{ext}"
-        executor.submit(process_media_upload, media_id, filename, sender_id, media_type, None)
+        # Submit and wait for completion
+        future = executor.submit(process_media_upload, media_id, filename, sender_id, media_type, None)
+        future.result()  # Synchronize
         return True
     return False
+
+
 
 def handle_list_uploads(sender_id):
     with media_buffer_lock:
@@ -985,27 +988,7 @@ def manage_upload_timer(sender_id):
             t.start()
 
 
-def add_media_to_buffer(sender_id, media_type, media_path, caption=None):
-    try:
-        if not media_path:
-            raise ValueError("Media path is empty or missing.")
-        if not media_type:
-            raise ValueError("Media type is required.")
 
-        with media_buffer_lock:
-            media_buffer.setdefault(sender_id, []).append({
-                "media_type": media_type,
-                "media_path": media_path,
-                "caption": caption.strip() if caption else None,
-                "timestamp": time.time()
-            })
-
-            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(media_buffer[sender_id])}")
-            return True
-
-    except Exception as e:
-        logging.error(f"❌ Failed to add media for {sender_id}: {e}", exc_info=True)
-        return False
 
 
 def process_webhook(data):
