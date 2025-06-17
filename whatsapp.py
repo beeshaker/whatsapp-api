@@ -658,8 +658,10 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             captions = [entry["caption"] for entry in media_list if entry.get("caption")]
             if captions:
                 description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
+            elif media_list:
+                description = "No description provided. Media uploaded only."
             else:
-                send_whatsapp_message(sender_id, "✏️ Please describe your issue.")
+                send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
                 return
 
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
@@ -674,8 +676,8 @@ def handle_ticket_creation(sender_id, message_text, property_id):
         for entry in media_list:
             age = now - entry["timestamp"]
             logging.info(f"⏳ Media age for {sender_id}: {age:.2f}s ({entry['media_type']})")
-            # Include media if within 10 minutes AND uploaded after the last text message context
-            if age < 600 and entry["timestamp"] >= last_upload_time - 10:  # 10-second grace period
+            # Include media if within 10 minutes AND uploaded recently
+            if age < 600 and entry["timestamp"] >= last_upload_time - 300:  # 5-minute grace period
                 recent_media.append(entry)
 
         if not recent_media:
@@ -939,17 +941,17 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     category = user_info[0]["temp_category"]
 
     description = message_text.strip()
-        if not description:
-            with media_buffer_lock:
-                media_list = media_buffer.get(sender_id, [])
-                captions = [entry["caption"] for entry in media_list if entry.get("caption") and entry["caption"] != "No Caption"]
-                if captions:
-                    description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
-                elif media_list:
-                    description = "No description provided. Media uploaded only."
-                else:
-                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
-                    return
+    if not description:
+        with media_buffer_lock:
+            media_list = media_buffer.get(sender_id, [])
+            captions = [entry["caption"] for entry in media_list if entry.get("caption") and entry["caption"] != "No Caption"]
+            if captions:
+                description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
+            elif media_list:
+                description = "No description provided. Media uploaded only."
+            else:
+                send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
+                return
 
 
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
