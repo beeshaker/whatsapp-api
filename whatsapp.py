@@ -875,13 +875,17 @@ def handle_ticket_creation(sender_id, message_text, property_id):
         ORDER BY created_at DESC
         LIMIT 1
     """, (user_id,))
-
+    
+    '''
     if ticket_check:
         last_created = ticket_check[0]["created_at"]
         if (datetime.now() - last_created).total_seconds() < 30:  # 5-minute cooldown
             logging.info(f"🛑 Ticket already created recently for user {sender_id}. Skipping.")
             send_whatsapp_message(sender_id, "🛑 You recently created a ticket. Please wait before creating another.")
             return
+    '''
+
+    
 
     description = message_text.strip()
     if not description:
