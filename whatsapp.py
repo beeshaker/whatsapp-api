@@ -829,15 +829,15 @@ def handle_ticket_creation(sender_id, message_text, property_id):
 
     with media_buffer_lock:
         media_list = list(media_buffer.get(sender_id, []))  # Safe copy
-        logging.info(f"📎 [TRACE] media_buffer at start of ticket creation for {sender_id}: {media_list}")
+        logging.info(f"📎 [DEBUG] Retrieved media list for {sender_id}: {media_list}")
 
         recent_media = []
         now = time.time()
         for entry in media_list:
             age = now - entry["timestamp"]
-            logging.info(f"⏱️ Entry: {entry['media_type']}, timestamp: {entry['timestamp']}, age: {age:.2f}s")
-            # Temporarily INCLUDE all media unconditionally to test attachment
-            recent_media.append(entry)
+            logging.info(f"⏳ Media age for {sender_id}: {age:.2f}s ({entry['media_type']})")
+            if age < 600:  # 10-minute limit
+                recent_media.append(entry)
 
         if not recent_media:
             logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
@@ -849,16 +849,14 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             else:
                 logging.error(f"❌ Failed to link media to ticket #{ticket_id} for {sender_id}")
 
-        # Clean up the media buffer
+        # Clean buffer
         remaining = [entry for entry in media_list if entry not in recent_media]
         if remaining:
             media_buffer[sender_id] = remaining
-            logging.info(f"♻️ Remaining media retained for {sender_id}")
         else:
-            #media_buffer.pop(sender_id, None)
-            logging.info(f"🧹 Cleared media buffer for {sender_id}")
+            media_buffer.pop(sender_id, None)
 
-    # Reset flow state
+    # Reset user flow state
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
@@ -987,30 +985,58 @@ def manage_upload_timer(sender_id):
             t.start()
 
 
+def add_media_to_buffer(sender_id, media_type, media_path, caption=None):
+    try:
+        if not media_path:
+            raise ValueError("Media path is empty or missing.")
+        if not media_type:
+            raise ValueError("Media type is required.")
+
+        with media_buffer_lock:
+            media_buffer.setdefault(sender_id, []).append({
+                "media_type": media_type,
+                "media_path": media_path,
+                "caption": caption.strip() if caption else None,
+                "timestamp": time.time()
+            })
+
+            logging.info(f"📦 Added {media_type} for {sender_id}. Total: {len(media_buffer[sender_id])}")
+            return True
+
+    except Exception as e:
+        logging.error(f"❌ Failed to add media for {sender_id}: {e}", exc_info=True)
+        return False
 
 
 def process_webhook(data):
     """Processes incoming WhatsApp messages from Meta Webhook."""
     purge_expired_items()
     logging.info(f"Processing webhook data:\n{json.dumps(data, indent=2)}")
+
     if "entry" not in data:
         logging.warning("No 'entry' found in webhook data.")
         return
+
     for entry in data["entry"]:
         for change in entry.get("changes", []):
             value = change.get("value", {})
             if "statuses" in value:
                 logging.info(f"Ignoring status update for message ID {value['statuses'][0]['id']}")
                 continue
+
             for message in value.get("messages", []):
                 message_id, sender_id, message_text = extract_message_info(message)
                 logging.info(f"Message from {sender_id} ({message_id}): {message_text}")
                 logging.debug(f"terms_pending_users: {terms_pending_users}, temp_opt_in_data: {temp_opt_in_data}")
-                # Handle button
+
+                # Handle button replies
                 if "interactive" in message and "button_reply" in message["interactive"]:
                     handle_button_reply(message, sender_id)
                     continue
-                normalized = message_text.strip().lower()
+
+                # Normalize message text
+                normalized = message_text.strip().lower() if message_text else ""
+
                 # Handle TOS acceptance
                 if normalized in ["accept", "reject"]:
                     with terms_pending_lock:
@@ -1018,62 +1044,20 @@ def process_webhook(data):
                             temp_opt_in_data.pop(sender_id, None)
                             terms_pending_users.pop(sender_id, None)
                             executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
-                            continue
-                        executor.submit(handle_accept, sender_id)
+                        else:
+                            executor.submit(handle_accept, sender_id)
                     continue
-                # Validate message
+
+                # Deduplicate
                 if not is_valid_message(sender_id, message_id, message_text):
                     logging.info(f"Invalid/duplicate message for {sender_id}")
                     continue
-                # Handle media
-                media_type = message.get("type")
-                if media_type in ["document", "image", "video"]:
-                    media_id = message[media_type]["id"]
-                    base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
-                    name, ext = os.path.splitext(base_filename)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"{name}_{timestamp}{ext}"
 
-                    download_result = download_media(media_id, filename)
-                    if "success" in download_result:
-                        success = process_media_upload(
-                            sender_id=sender_id,
-                            media_type=media_type,
-                            media_path=download_result["path"],
-                            caption=message_text
-                        )
-
-                        if not success:
-                            send_whatsapp_message(sender_id, f"❌ Failed to save your {media_type}. Please try again.")
-                            continue
-
-                        media_count = len(media_buffer.get(sender_id, []))
-
-                        user_status = query_database(
-                            "SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s",
-                            (sender_id,)
-                        )
-                        logging.info(f"👤 User status after media upload: {user_status}")
-                        if not user_status or user_status[0]["last_action"] != "awaiting_issue_description":
-                            if user_status and not user_status[0]["temp_category"]:
-                                send_whatsapp_message(sender_id, "✅ File received! Please select a category.")
-                                send_category_prompt(sender_id)
-                            else:
-                                query_database(
-                                    "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-                                    (sender_id,), commit=True
-                                )
-                                send_whatsapp_message(sender_id, f"✅ File received! You’ve uploaded {media_count} file(s). Describe your issue or reply /done.")
-                            manage_upload_timer(sender_id)
-                        else:
-                            send_whatsapp_message(sender_id, f"✅ {media_type.title()} received! You’ve uploaded {media_count} file(s). Describe your issue or reply /done.")
-                        continue
-                    else:
-                        logging.error(f"Media download failed: {download_result}")
-                        send_whatsapp_message(sender_id, f"❌ Failed to download your {media_type}. Try again.")
+                # Handle media uploads via cleaner handler
+                if handle_media_upload(message, sender_id, message_text):
                     continue
-                
-                # Command handling
+
+                # Handle commands
                 if normalized == "/clear_attachments":
                     handle_clear_attachments(sender_id)
                     continue
@@ -1090,18 +1074,22 @@ def process_webhook(data):
                     else:
                         send_whatsapp_message(sender_id, "⚠️ Provide upload number (e.g., /remove_upload 1)")
                     continue
-                # Final fallback based on user status
+
+                # Fallback: handle based on user flow status
                 user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
                 user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
                 if not user_status or not user_info:
                     send_whatsapp_message(sender_id, "⚠️ You are not registered. Please contact support.")
                     continue
+
                 last_action = user_status[0]["last_action"]
                 property_id = user_info[0]["property_id"]
+
                 if last_action == "awaiting_category":
                     handle_category_selection(sender_id, message_text)
                 elif last_action == "awaiting_issue_description":
                     handle_ticket_creation(sender_id, message_text, property_id)
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
-                    
+                else:
+                    send_whatsapp_message(sender_id, "🤖 Sorry, I didn't understand that. Please choose an option from the menu.")
