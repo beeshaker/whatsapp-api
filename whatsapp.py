@@ -461,35 +461,7 @@ def purge_expired_items():
 
         
         
-def flush_user_media_after_ticket(sender_id, ticket_id):
-    """Flushes media entries to the DB for a given user after ticket is created."""
-    logging.info(f"⏳ Flushing media for ticket #{ticket_id} by user {sender_id}")
 
-    # Mark user state as 'creating_ticket'
-    query_database(
-        "UPDATE users SET last_action = 'creating_ticket' WHERE whatsapp_number = %s",
-        (sender_id,),
-        commit=True
-    )
-
-    with media_buffer_lock:
-        media_list = media_buffer.get(sender_id, [])
-        for entry in media_list:
-            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-            if not success:
-                logging.error(f"❌ Failed to save media for ticket #{ticket_id} from {sender_id}: {entry}")
-                send_whatsapp_message(sender_id, "⚠️ One of your attachments failed to save. Please resend if necessary.")
-
-        #del media_buffer[sender_id]  # Clear after processing
-
-    # Reset user state to 'idle'
-    query_database(
-        "UPDATE users SET last_action = 'idle' WHERE whatsapp_number = %s",
-        (sender_id,),
-        commit=True
-    )
-
-    logging.info(f"✅ Media saved and flushed for ticket #{ticket_id} by user {sender_id}")
 
         
         
@@ -771,37 +743,6 @@ def send_done_upload_prompt(sender_id):
 
        
     
-def create_ticket_with_media(sender_id, user_id, category, property, description):   
-    ticket_id = insert_ticket_and_get_id(user_id, description, category, property)
-
-    with media_buffer_lock:
-        media_list = list(media_buffer.get(sender_id, []))
-        logging.info(f"📎 Media buffer before filtering for {sender_id}: {media_list}")
-
-        if not media_list:
-            logging.warning(f"No media found for sender {sender_id} during ticket creation.")
-        else:
-            for entry in media_list:
-                save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-                logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
-            #del media_buffer[sender_id]
-
-    query_database(
-        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
-        (sender_id,), commit=True
-    )
-
-    executor.submit(send_whatsapp_message, sender_id,
-        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(media_list)} attachment(s). Our team will get back to you soon!")
-
-    with user_timers_lock:
-        if sender_id in upload_state:
-            if upload_state[sender_id]["timer"]:
-                upload_state[sender_id]["timer"].cancel()
-            del upload_state[sender_id]
-
-
-
 
 
 def handle_done_command(sender_id):
@@ -888,15 +829,15 @@ def handle_ticket_creation(sender_id, message_text, property_id):
 
     with media_buffer_lock:
         media_list = list(media_buffer.get(sender_id, []))  # Safe copy
-        logging.info(f"📎 [DEBUG] Retrieved media list for {sender_id}: {media_list}")
+        logging.info(f"📎 [TRACE] media_buffer at start of ticket creation for {sender_id}: {media_list}")
 
         recent_media = []
         now = time.time()
         for entry in media_list:
             age = now - entry["timestamp"]
-            logging.info(f"⏳ Media age for {sender_id}: {age:.2f}s ({entry['media_type']})")
-            if age < 600:  # 10-minute limit
-                recent_media.append(entry)
+            logging.info(f"⏱️ Entry: {entry['media_type']}, timestamp: {entry['timestamp']}, age: {age:.2f}s")
+            # Temporarily INCLUDE all media unconditionally to test attachment
+            recent_media.append(entry)
 
         if not recent_media:
             logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
@@ -908,14 +849,16 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             else:
                 logging.error(f"❌ Failed to link media to ticket #{ticket_id} for {sender_id}")
 
-        # Clean buffer
+        # Clean up the media buffer
         remaining = [entry for entry in media_list if entry not in recent_media]
         if remaining:
             media_buffer[sender_id] = remaining
+            logging.info(f"♻️ Remaining media retained for {sender_id}")
         else:
             media_buffer.pop(sender_id, None)
+            logging.info(f"🧹 Cleared media buffer for {sender_id}")
 
-    # Reset user flow state
+    # Reset flow state
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
