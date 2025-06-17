@@ -1173,3 +1173,4 @@ def process_webhook(data):
                     handle_ticket_creation(sender_id, message_text, property_id)
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
+                    
