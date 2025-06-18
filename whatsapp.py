@@ -17,6 +17,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
+
+#image uploading finally works  
+
 # Create logs directory if not exists
 os.makedirs("logs", exist_ok=True)
 
