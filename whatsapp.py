@@ -1133,50 +1133,57 @@ def process_webhook(data):
                     if normalized not in ["1", "2", "3", "4"]:
                         send_whatsapp_message(sender_id, "⚠️ Please select a category by replying with 1, 2, 3, or 4.")
                         send_category_prompt(sender_id)
-                        continue
+                        return
 
                 if last_action == "awaiting_upload":
                     if message.get("type") not in ["image", "video", "document"]:
                         send_whatsapp_message(sender_id, "📎 Please upload a file before describing your issue.")
-                        continue
+                        return
 
                 if last_action == "awaiting_issue_description" and not media_buffer.get(sender_id):
                     send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
-                    continue
+                    return
 
                 # Handle media uploads
                 if handle_media_upload(message, sender_id, message_text):
-                    continue
+                    return
 
                 # Handle system commands
                 if normalized == "/clear_attachments":
                     handle_clear_attachments(sender_id)
-                    continue
+                    return
                 if normalized == "/done":
                     handle_done_command(sender_id)
-                    continue
+                    return
                 if normalized == "/list_uploads":
                     handle_list_uploads(sender_id)
-                    continue
+                    return
                 if normalized.startswith("/remove_upload"):
                     parts = normalized.split()
                     if len(parts) == 2:
                         handle_remove_upload(sender_id, parts[1])
                     else:
                         send_whatsapp_message(sender_id, "⚠️ Use like this: /remove_upload 1")
-                    continue
+                    return
                 if normalized == "/status":
                     send_whatsapp_message(sender_id, f"📋 Current state: {last_action}, Category: {temp_category}")
-                    continue
+                    return
 
                 # Handle state-based flow
                 if last_action == "awaiting_category":
                     handle_category_selection(sender_id, message_text)
+                    return
+
                 elif last_action == "awaiting_issue_description":
                     handle_ticket_creation(sender_id, message_text, property_id)
+                    return
+
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
-                else:
-                    send_whatsapp_message(sender_id, "🤖 I didn’t understand that. Please choose an option from the menu.")
+                    return
+
+                # Fallback response
+                send_whatsapp_message(sender_id, "🤖 I didn’t understand that. Please choose an option from the menu.")
 
     purge_expired_items()
+
