@@ -611,7 +611,7 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     user_id = user_info[0]["id"]
     category = user_info[0]["temp_category"]
 
-    # Extract issue description or fallback to captions
+    # Extract or fallback to media captions
     description = message_text.strip()
     if not description:
         with media_buffer_lock:
@@ -625,15 +625,21 @@ def handle_ticket_creation(sender_id, message_text, property_id):
                 send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
                 return
 
+    # ✅ Immediately reset user state BEFORE media processing to avoid looping
+    query_database(
+        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+        (sender_id,), commit=True
+    )
+    with user_timers_lock:
+        user_timers.pop(sender_id, None)
+
     # Create the ticket
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
 
-    # Link recent media uploads
+    # Process and attach recent media
+    recent_media = []
     with media_buffer_lock:
         media_list = list(media_buffer.get(sender_id, []))  # Safe copy
-        logging.info(f"📎 [DEBUG] Retrieved media list for {sender_id}: {media_list}")
-
-        recent_media = []
         now = time.time()
         last_upload_time = upload_state.get(sender_id, {}).get("last_upload_time", 0)
 
@@ -650,27 +656,17 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             if not success:
                 logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
 
-        # Clean up buffer
+        # Clean up used media
         if recent_media:
             media_buffer[sender_id] = [entry for entry in media_list if entry not in recent_media]
         else:
             media_buffer.pop(sender_id, None)
 
-    # Reset user state
-    query_database(
-        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
-        (sender_id,), commit=True
-    )
-
-    with user_timers_lock:
-        user_timers.pop(sender_id, None)
-
+    # Confirmation message
     send_whatsapp_message(
         sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
     )
-
-
 
 
 def handle_button_reply(message, sender_id):
