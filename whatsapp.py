@@ -753,14 +753,21 @@ def handle_media_upload(message, sender_id, message_text):
 
 
 def handle_list_uploads(sender_id):
-    media_list = query_database("SELECT id, media_type, caption FROM temp_ticket_media WHERE sender_id = %s ORDER BY id ASC", (sender_id,))
+    media_list = query_database("""
+        SELECT media_type, caption FROM temp_ticket_media
+        WHERE sender_id = %s
+        ORDER BY uploaded_at
+    """, (sender_id,))
+    
     if not media_list:
         send_whatsapp_message(sender_id, "📎 You have no pending uploads.")
         return
+
     message = f"📎 Your pending uploads ({len(media_list)}):\n"
     for i, entry in enumerate(media_list, 1):
-        caption = entry.get("caption", "No caption")
+        caption = entry["caption"] or "No caption"
         message += f"{i}. {entry['media_type'].capitalize()}: {caption[:30]}...\n"
+
     message += "\nReply /remove_upload <number> to delete a specific file or /clear_attachments to clear all."
     send_whatsapp_message(sender_id, message)
 
@@ -769,15 +776,21 @@ def handle_list_uploads(sender_id):
 def handle_remove_upload(sender_id, upload_index):
     try:
         index = int(upload_index) - 1
-        uploads = query_database("SELECT id FROM temp_ticket_media WHERE sender_id = %s ORDER BY id ASC", (sender_id,))
-        if 0 <= index < len(uploads):
-            media_id = uploads[index]["id"]
-            query_database("DELETE FROM temp_ticket_media WHERE id = %s", (media_id,), commit=True)
-            executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed upload #{index + 1}.")
+        media_list = query_database("""
+            SELECT id, media_type FROM temp_ticket_media
+            WHERE sender_id = %s
+            ORDER BY uploaded_at
+        """, (sender_id,))
+        
+        if 0 <= index < len(media_list):
+            removed = media_list[index]
+            query_database("DELETE FROM temp_ticket_media WHERE id = %s", (removed["id"],), commit=True)
+            executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
         else:
             executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
     except ValueError:
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).")
+
 
         
         
@@ -814,38 +827,33 @@ def send_done_upload_prompt(sender_id):
     logging.info(f"Sent done upload prompt to {sender_id}: {response.json()}")
 
 
-
-       
-    
-
-
 def handle_done_command(sender_id):
     user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-    
-    attachments = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
-    media_count = attachments[0]["count"] if attachments else 0
+    media_count = query_database("SELECT COUNT(*) as count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    count = media_count[0]["count"] if media_count else 0
 
-    logging.info(f"Processing /done for {sender_id}: {media_count} attachments found")
+    logging.info(f"Processing /done for {sender_id}: {count} attachments found")
 
     with user_timers_lock:
-        if sender_id in upload_state and upload_state[sender_id]["timer"]:
+        if sender_id in upload_state and upload_state[sender_id].get("timer"):
             upload_state[sender_id]["timer"].cancel()
             upload_state[sender_id]["timer"] = None
             logging.info(f"Cancelled upload timer for {sender_id}")
 
-    if media_count == 0:
+    if count == 0:
         executor.submit(send_whatsapp_message, sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
     else:
-        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {media_count} file(s). Please describe your issue to proceed.")
+        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {count} file(s). Please describe your issue to proceed.")
 
     if user_data and user_data[0]["temp_category"]:
         query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-        if media_count == 0:
+        if count == 0:
             executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
     else:
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please select a category first.")
         executor.submit(send_category_prompt, sender_id)
+
 
 
     
