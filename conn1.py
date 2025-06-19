@@ -119,3 +119,27 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
         except Exception as e:
             logging.error(f"❌ Error while registering user {whatsapp_number}: {e}")
             raise
+        
+        
+def save_temp_media_to_db(sender_id, media_type, media_path, caption):
+    """
+    Saves a media reference temporarily in the database before ticket creation.
+    """
+    query = text("""
+        INSERT INTO temp_ticket_media (sender_id, media_type, media_path, caption)
+        VALUES (:sender_id, :media_type, :media_path, :caption)
+    """)
+    try:
+        engine = get_db_connection1()
+        with engine.connect() as conn:
+            conn.execute(query, {
+                "sender_id": sender_id,
+                "media_type": media_type,
+                "media_path": media_path,
+                "caption": caption
+            })
+            conn.commit()
+            logging.info(f"✅ Temp media saved for {sender_id}: {media_type} -> {media_path}")
+    except Exception as e:
+        logging.error(f"❌ Failed to insert temp media for {sender_id}: {e}")
+
