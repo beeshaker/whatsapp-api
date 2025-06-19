@@ -540,9 +540,11 @@ def is_valid_message(sender_id, message_id, message_text):
 def process_media_upload(media_id, filename, sender_id, media_type, message_text):
     """
     Handles media upload during ticket creation.
-    Enforces that media is only accepted after category selection,
-    buffers the media, and updates the user's state.
+    Stores uploads in the temp_ticket_media table instead of in-memory buffer.
+    Enforces correct flow: only accept media after category selection.
     """
+    from conn1 import save_temp_media_to_db
+
     user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
     if not user_status:
         logging.warning(f"❌ Unregistered user tried to upload media: {sender_id}")
@@ -563,16 +565,15 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
         send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
         return
 
-    with media_buffer_lock:
-        media_buffer.setdefault(sender_id, []).append({
-            "media_type": media_type,
-            "media_path": download_result["path"],
-            "caption": message_text.strip() if message_text else "No Caption",
-            "timestamp": time.time()
-        })
-        media_count = len(media_buffer[sender_id])
-        logging.info(f"📦 Media added for {sender_id}. Total in buffer: {media_count}")
+    caption = message_text.strip() if message_text else "No Caption"
+    save_temp_media_to_db(sender_id, media_type, download_result["path"], caption)
 
+    # Count uploads
+    count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    media_count = count_result[0]["count"] if count_result else 0
+    logging.info(f"📦 Media added for {sender_id}. Total in DB: {media_count}")
+
+    # Start upload prompt and reminder
     with user_timers_lock:
         upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "last_upload_time": time.time(), "timer": None})
         upload_state[sender_id]["media_count"] = media_count
@@ -581,21 +582,101 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
     if media_count == 1:
         query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         send_whatsapp_message(sender_id, "✅ File received! Please describe your issue or upload more.")
+
         def prompt_reminder():
             time.sleep(120)
             status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
             if status and status[0]["last_action"] == "awaiting_issue_description":
                 send_whatsapp_message(sender_id, "⏳ Reminder: please describe your issue or use /done.")
+
         threading.Thread(target=prompt_reminder, daemon=True).start()
     else:
         send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Use /done when ready.")
-        manage_upload_timer(sender_id)
+
+
+def handle_ticket_creation(sender_id, message_text, property_id):
+    from conn1 import insert_ticket_and_get_id, save_ticket_media
+
+    # 🛡️ Prevent duplicate ticket creation
+    current_state = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
+    if current_state and not current_state[0]["last_action"]:
+        logging.info(f"🔁 Ticket creation ignored for {sender_id} – state already cleared.")
+        return
+
+    user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+    if not user_info:
+        send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
+        return
+
+    user_id = user_info[0]["id"]
+    category = user_info[0]["temp_category"]
+
+    # Extract or fallback to media captions
+    description = message_text.strip()
+    if not description:
+        media_records = query_database("""
+            SELECT caption FROM temp_ticket_media
+            WHERE sender_id = %s
+            ORDER BY id ASC
+        """, (sender_id,))
+        captions = [row["caption"] for row in media_records if row["caption"] != "No Caption"]
+        if captions:
+            description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
+        elif media_records:
+            description = "No description provided. Media uploaded only."
+        else:
+            send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
+            return
+
+    # ✅ Reset state BEFORE sending confirmation
+    query_database(
+        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+        (sender_id,), commit=True
+    )
+    with user_timers_lock:
+        user_timers.pop(sender_id, None)
+
+    # 🧾 Create the ticket
+    ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
+
+    # 📎 Attach valid media from DB (within last 10 minutes)
+    ten_minutes_ago = time.time() - 600
+    recent_media = query_database("""
+        SELECT id, media_type, media_path
+        FROM temp_ticket_media
+        WHERE sender_id = %s
+        AND UNIX_TIMESTAMP(created_at) >= %s
+    """, (sender_id, int(ten_minutes_ago)))
+
+    for entry in recent_media:
+        success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+        if not success:
+            logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
+        else:
+            logging.info(f"📁 Attached {entry['media_type']} to ticket #{ticket_id}")
+
+    # 🧹 Delete used media from temp_ticket_media
+    if recent_media:
+        media_ids = tuple([entry["id"] for entry in recent_media])
+        placeholder = ", ".join(["%s"] * len(media_ids))
+        query_database(
+            f"DELETE FROM temp_ticket_media WHERE id IN ({placeholder})",
+            media_ids,
+            commit=True
+        )
+
+    # ✅ Final confirmation
+    send_whatsapp_message(
+        sender_id,
+        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
+    )
 
 
 
 
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
+    
     logging.info(f"🔘 Button clicked: {button_id} by {sender_id}")
 
     if button_id in ["upload_done", "upload_not_done", "caption_confirm_yes", "caption_confirm_no"]:
@@ -604,17 +685,23 @@ def handle_button_reply(message, sender_id):
                 upload_state[sender_id]["timer"].cancel()
                 upload_state[sender_id]["timer"] = None
 
-    if button_id == "accept_terms":
-        user = temp_opt_in_data.get(sender_id)
-        if user:
-            executor.submit(handle_accept, sender_id)
-        else:
-            logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
-            executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
+    elif button_id == "accept_terms":
+        try:
+            user = temp_opt_in_data.get(sender_id)
+            if user:
+                executor.submit(handle_accept, sender_id)
+            else:
+                logging.warning(f"⚠️ No temp data found for {sender_id} in temp_opt_in_data.")
+                executor.submit(send_whatsapp_message, sender_id, "⚠️ Something went wrong. Please try again.")
+        except Exception as e:
+            logging.error(f"❌ Exception during user registration for {sender_id}: {e}", exc_info=True)
+            executor.submit(send_whatsapp_message, sender_id, "❌ An error occurred during registration. Please contact support.")
 
     elif button_id == "reject_terms":
-        terms_pending_users.pop(sender_id, None)
-        temp_opt_in_data.pop(sender_id, None)
+        if sender_id in terms_pending_users:
+            del terms_pending_users[sender_id]
+        if sender_id in temp_opt_in_data:
+            del temp_opt_in_data[sender_id]
         executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
 
     elif button_id == "create_ticket":
@@ -626,13 +713,12 @@ def handle_button_reply(message, sender_id):
 
     elif button_id == "upload_done":
         user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-        with media_buffer_lock:
-            has_media = bool(media_buffer.get(sender_id))
-        if user_data and user_data[0]["temp_category"] and has_media:
+        if user_data and user_data[0]["temp_category"]:
             query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
         else:
-            executor.submit(send_whatsapp_message, sender_id, "📎 Please upload at least one file before confirming.")
+            query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+            executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "upload_not_done":
         executor.submit(send_whatsapp_message, sender_id, "👍 Okay, send more files when you're ready.")
@@ -643,20 +729,22 @@ def handle_button_reply(message, sender_id):
             query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             with media_buffer_lock:
                 media_count = len(media_buffer.get(sender_id, []))
-            executor.submit(send_whatsapp_message, sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Please describe your issue.")
+            executor.submit(send_whatsapp_message, sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
             manage_upload_timer(sender_id)
         else:
             query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
             executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "caption_confirm_no":
+        executor.submit(send_whatsapp_message, sender_id, "📝 Please upload the files again with corrected captions.")
         with media_buffer_lock:
-            media_buffer.pop(sender_id, None)
+            if sender_id in media_buffer:
+                #del media_buffer[sender_id]
+                pass
         with user_timers_lock:
             if sender_id in upload_state:
-                upload_state[sender_id]["timer"].cancel()
-                upload_state.pop(sender_id, None)
-        executor.submit(send_whatsapp_message, sender_id, "📝 Please re-upload your files with the correct captions.")
+                upload_state[sender_id]["media_count"] = 0
+                upload_state[sender_id]["last_upload_time"] = 0
 
         
         
@@ -678,8 +766,7 @@ def handle_media_upload(message, sender_id, message_text):
 
 
 def handle_list_uploads(sender_id):
-    with media_buffer_lock:
-        media_list = media_buffer.get(sender_id, [])
+    media_list = query_database("SELECT id, media_type, caption FROM temp_ticket_media WHERE sender_id = %s ORDER BY id ASC", (sender_id,))
     if not media_list:
         send_whatsapp_message(sender_id, "📎 You have no pending uploads.")
         return
@@ -691,20 +778,20 @@ def handle_list_uploads(sender_id):
     send_whatsapp_message(sender_id, message)
 
 
+
 def handle_remove_upload(sender_id, upload_index):
     try:
         index = int(upload_index) - 1
-        with media_buffer_lock:
-            if sender_id in media_buffer and 0 <= index < len(media_buffer[sender_id]):
-                removed = media_buffer[sender_id].pop(index)
-                executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
-                if not media_buffer[sender_id]:
-                    #del media_buffer[sender_id]
-                    pass
-            else:
-                executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
+        uploads = query_database("SELECT id FROM temp_ticket_media WHERE sender_id = %s ORDER BY id ASC", (sender_id,))
+        if 0 <= index < len(uploads):
+            media_id = uploads[index]["id"]
+            query_database("DELETE FROM temp_ticket_media WHERE id = %s", (media_id,), commit=True)
+            executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed upload #{index + 1}.")
+        else:
+            executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
     except ValueError:
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).")
+
         
         
 
@@ -712,8 +799,9 @@ def handle_remove_upload(sender_id, upload_index):
         
         
 def send_done_upload_prompt(sender_id):
-    with media_buffer_lock:
-        media_count = len(media_buffer.get(sender_id, []))
+    media_count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    media_count = media_count_result[0]["count"] if media_count_result else 0
+
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
@@ -739,40 +827,39 @@ def send_done_upload_prompt(sender_id):
     logging.info(f"Sent done upload prompt to {sender_id}: {response.json()}")
 
 
+
        
     
 
 
 def handle_done_command(sender_id):
     user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+    
+    attachments = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    media_count = attachments[0]["count"] if attachments else 0
 
-    with media_buffer_lock:
-        attachments = media_buffer.get(sender_id, [])
+    logging.info(f"Processing /done for {sender_id}: {media_count} attachments found")
 
-    logging.info(f"Processing /done for {sender_id}: {len(attachments)} attachments found")
-
-    # Cancel any existing upload timer
     with user_timers_lock:
         if sender_id in upload_state and upload_state[sender_id]["timer"]:
             upload_state[sender_id]["timer"].cancel()
             upload_state[sender_id]["timer"] = None
             logging.info(f"Cancelled upload timer for {sender_id}")
 
-    # Handle case with no attachments
-    if not attachments:
+    if media_count == 0:
         executor.submit(send_whatsapp_message, sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
     else:
-        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {len(attachments)} file(s). Please describe your issue to proceed.")
+        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {media_count} file(s). Please describe your issue to proceed.")
 
-    # Check category and update user state
     if user_data and user_data[0]["temp_category"]:
         query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
-        if not attachments:
+        if media_count == 0:
             executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
     else:
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please select a category first.")
         executor.submit(send_category_prompt, sender_id)
+
 
     
 def handle_clear_attachments(sender_id):
@@ -804,12 +891,6 @@ def handle_category_selection(sender_id: str, message_text: str):
         
 
 def handle_ticket_creation(sender_id, message_text, property_id):
-    # 🛡️ Prevent duplicate ticket creation
-    current_state = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
-    if current_state and not current_state[0]["last_action"]:
-        logging.info(f"🔁 Ticket creation ignored for {sender_id} – state already cleared.")
-        return
-
     user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
     if not user_info:
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
@@ -818,7 +899,6 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     user_id = user_info[0]["id"]
     category = user_info[0]["temp_category"]
 
-    # Extract or fallback to media captions
     description = message_text.strip()
     if not description:
         with media_buffer_lock:
@@ -832,49 +912,52 @@ def handle_ticket_creation(sender_id, message_text, property_id):
                 send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
                 return
 
-    # ✅ Reset state BEFORE sending confirmation to avoid repeat creation
+
+    ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
+
+    with media_buffer_lock:
+        media_list = list(media_buffer.get(sender_id, []))  # Safe copy
+        logging.info(f"📎 [DEBUG] Retrieved media list for {sender_id}: {media_list}")
+
+        recent_media = []
+        now = time.time()
+        for entry in media_list:
+            age = now - entry["timestamp"]
+            logging.info(f"⏳ Media age for {sender_id}: {age:.2f}s ({entry['media_type']})")
+            if age < 600:  # 10-minute limit
+                recent_media.append(entry)
+
+        if not recent_media:
+            logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
+
+        for entry in recent_media:
+            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+            if success:
+                logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
+            else:
+                logging.error(f"❌ Failed to link media to ticket #{ticket_id} for {sender_id}")
+
+        # Clean buffer
+        remaining = [entry for entry in media_list if entry not in recent_media]
+        if remaining:
+            media_buffer[sender_id] = remaining
+        else:
+            media_buffer.pop(sender_id, None)
+
+    # Reset user flow state
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
     )
-    with user_timers_lock:
-        user_timers.pop(sender_id, None)
 
-    # Create the ticket
-    ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
-
-    # Process and attach recent media
-    recent_media = []
-    with media_buffer_lock:
-        media_list = list(media_buffer.get(sender_id, []))
-        now = time.time()
-        last_upload_time = upload_state.get(sender_id, {}).get("last_upload_time", 0)
-
-        for entry in media_list:
-            age = now - entry["timestamp"]
-            if age < 600 and entry["timestamp"] >= last_upload_time - 300:
-                recent_media.append(entry)
-                logging.info(f"📁 Using {entry['media_type']} for ticket #{ticket_id}")
-            else:
-                logging.info(f"⏳ Skipped stale {entry['media_type']} (age={age:.1f}s)")
-
-        for entry in recent_media:
-            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-            if not success:
-                logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
-
-        # Clean up used media
-        if recent_media:
-            media_buffer[sender_id] = [entry for entry in media_list if entry not in recent_media]
-        else:
-            media_buffer.pop(sender_id, None)
-
-    # Final confirmation
     send_whatsapp_message(
         sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
     )
 
+    with user_timers_lock:
+        if sender_id in user_timers:
+            del user_timers[sender_id]
 
         
 def mark_user_accepted(whatsapp_number):
@@ -976,16 +1059,20 @@ def manage_upload_timer(sender_id):
     with user_timers_lock:
         if sender_id in upload_state and upload_state[sender_id]["timer"]:
             upload_state[sender_id]["timer"].cancel()
+
         def send_prompt():
             with user_timers_lock:
-                if sender_id in upload_state and upload_state[sender_id]["media_count"] > 1:
+                count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+                count = count_result[0]["count"] if count_result else 0
+                if count > 1:
                     send_done_upload_prompt(sender_id)
                     upload_state[sender_id]["timer"] = None
-        with media_buffer_lock:
-            media_count = len(media_buffer.get(sender_id, []))
-        if media_count > 1:
+
+        count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+        count = count_result[0]["count"] if count_result else 0
+        if count > 1:
             t = Timer(10, send_prompt)
-            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": media_count, "last_upload_time": time.time()})
+            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": count, "last_upload_time": time.time()})
             upload_state[sender_id]["timer"] = t
             t.start()
 
@@ -993,9 +1080,10 @@ def manage_upload_timer(sender_id):
 
 
 
-def process_webhook(data):
-    """Processes incoming WhatsApp messages from Meta Webhook with strict flow enforcement."""
 
+def process_webhook(data):
+    """Processes incoming WhatsApp messages from Meta Webhook."""
+    
     logging.info(f"Processing webhook data:\n{json.dumps(data, indent=2)}")
 
     if "entry" not in data:
@@ -1014,12 +1102,15 @@ def process_webhook(data):
                 logging.info(f"Message from {sender_id} ({message_id}): {message_text}")
                 logging.debug(f"terms_pending_users: {terms_pending_users}, temp_opt_in_data: {temp_opt_in_data}")
 
+                # Handle button replies
                 if "interactive" in message and "button_reply" in message["interactive"]:
                     handle_button_reply(message, sender_id)
                     continue
 
+                # Normalize message text
                 normalized = message_text.strip().lower() if message_text else ""
 
+                # Handle TOS acceptance
                 if normalized in ["accept", "reject"]:
                     with terms_pending_lock:
                         if normalized == "reject":
@@ -1030,23 +1121,16 @@ def process_webhook(data):
                             executor.submit(handle_accept, sender_id)
                     continue
 
+                # Deduplicate
                 if not is_valid_message(sender_id, message_id, message_text):
-                    logging.info(f"Duplicate or rapid message ignored for {sender_id}")
+                    logging.info(f"Invalid/duplicate message for {sender_id}")
                     continue
 
-                user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-                user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
-                if not user_status or not user_info:
-                    send_whatsapp_message(sender_id, "⚠️ You are not registered. Please contact support.")
-                    continue
-
-                last_action = user_status[0]["last_action"]
-                temp_category = user_status[0]["temp_category"]
-                property_id = user_info[0]["property_id"]
-
+                # Handle media uploads via cleaner handler
                 if handle_media_upload(message, sender_id, message_text):
                     continue
 
+                # Handle commands
                 if normalized == "/clear_attachments":
                     handle_clear_attachments(sender_id)
                     continue
@@ -1061,11 +1145,18 @@ def process_webhook(data):
                     if len(parts) == 2:
                         handle_remove_upload(sender_id, parts[1])
                     else:
-                        send_whatsapp_message(sender_id, "⚠️ Use like this: /remove_upload 1")
+                        send_whatsapp_message(sender_id, "⚠️ Provide upload number (e.g., /remove_upload 1)")
                     continue
-                if normalized == "/status":
-                    send_whatsapp_message(sender_id, f"📋 Current state: {last_action}, Category: {temp_category}")
+
+                # Fallback: handle based on user flow status
+                user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+                user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
+                if not user_status or not user_info:
+                    send_whatsapp_message(sender_id, "⚠️ You are not registered. Please contact support.")
                     continue
+
+                last_action = user_status[0]["last_action"]
+                property_id = user_info[0]["property_id"]
 
                 if last_action == "awaiting_category":
                     handle_category_selection(sender_id, message_text)
@@ -1074,6 +1165,5 @@ def process_webhook(data):
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
                 else:
-                    send_whatsapp_message(sender_id, "🤖 I didn’t understand that. Please choose an option from the menu.")
-
+                    send_whatsapp_message(sender_id, "🤖 Sorry, I didn't understand that. Please choose an option from the menu.")
     purge_expired_items()
