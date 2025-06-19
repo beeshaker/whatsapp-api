@@ -595,9 +595,6 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
 
 
 def handle_ticket_creation(sender_id, message_text, property_id):
-    from conn1 import insert_ticket_and_get_id, save_ticket_media
-
-    # 🛡️ Prevent duplicate ticket creation
     current_state = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
     if current_state and not current_state[0]["last_action"]:
         logging.info(f"🔁 Ticket creation ignored for {sender_id} – state already cleared.")
@@ -611,24 +608,24 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     user_id = user_info[0]["id"]
     category = user_info[0]["temp_category"]
 
-    # Extract or fallback to media captions
+    # === Determine Issue Description ===
     description = message_text.strip()
     if not description:
-        media_records = query_database("""
-            SELECT caption FROM temp_ticket_media
-            WHERE sender_id = %s
-            ORDER BY id ASC
-        """, (sender_id,))
-        captions = [row["caption"] for row in media_records if row["caption"] != "No Caption"]
+        # Fallback to captions in temp_ticket_media
+        media_captions = query_database(
+            "SELECT caption FROM temp_ticket_media WHERE sender_id = %s",
+            (sender_id,)
+        )
+        captions = [entry["caption"] for entry in media_captions if entry["caption"] != "No Caption"]
         if captions:
             description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
-        elif media_records:
+        elif media_captions:
             description = "No description provided. Media uploaded only."
         else:
             send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
             return
 
-    # ✅ Reset state BEFORE sending confirmation
+    # Clear user state
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
         (sender_id,), commit=True
@@ -636,36 +633,26 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     with user_timers_lock:
         user_timers.pop(sender_id, None)
 
-    # 🧾 Create the ticket
+    # === Create Ticket ===
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
 
-    # 📎 Attach valid media from DB (within last 10 minutes)
-    ten_minutes_ago = time.time() - 600
-    recent_media = query_database("""
-        SELECT id, media_type, media_path
-        FROM temp_ticket_media
-        WHERE sender_id = %s
-        AND UNIX_TIMESTAMP(created_at) >= %s
-    """, (sender_id, int(ten_minutes_ago)))
-
-    for entry in recent_media:
-        success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-        if not success:
-            logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
-        else:
-            logging.info(f"📁 Attached {entry['media_type']} to ticket #{ticket_id}")
-
-    # 🧹 Delete used media from temp_ticket_media
+    # === Fetch and Attach Media from DB ===
+    recent_media = query_database(
+        "SELECT media_type, media_path FROM temp_ticket_media WHERE sender_id = %s",
+        (sender_id,)
+    )
     if recent_media:
-        media_ids = tuple([entry["id"] for entry in recent_media])
-        placeholder = ", ".join(["%s"] * len(media_ids))
-        query_database(
-            f"DELETE FROM temp_ticket_media WHERE id IN ({placeholder})",
-            media_ids,
-            commit=True
-        )
+        for entry in recent_media:
+            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
+            if not success:
+                logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
+        # Delete after use
+        query_database("DELETE FROM temp_ticket_media WHERE sender_id = %s", (sender_id,), commit=True)
+        logging.info(f"🧹 Cleaned temp_ticket_media for {sender_id}")
+    else:
+        logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
 
-    # ✅ Final confirmation
+    # === Confirm to user ===
     send_whatsapp_message(
         sender_id,
         f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
@@ -890,74 +877,7 @@ def handle_category_selection(sender_id: str, message_text: str):
         
         
 
-def handle_ticket_creation(sender_id, message_text, property_id):
-    user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-    if not user_info:
-        send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
-        return
 
-    user_id = user_info[0]["id"]
-    category = user_info[0]["temp_category"]
-
-    description = message_text.strip()
-    if not description:
-        with media_buffer_lock:
-            media_list = media_buffer.get(sender_id, [])
-            captions = [entry["caption"] for entry in media_list if entry.get("caption") and entry["caption"] != "No Caption"]
-            if captions:
-                description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
-            elif media_list:
-                description = "No description provided. Media uploaded only."
-            else:
-                send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
-                return
-
-
-    ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
-
-    with media_buffer_lock:
-        media_list = list(media_buffer.get(sender_id, []))  # Safe copy
-        logging.info(f"📎 [DEBUG] Retrieved media list for {sender_id}: {media_list}")
-
-        recent_media = []
-        now = time.time()
-        for entry in media_list:
-            age = now - entry["timestamp"]
-            logging.info(f"⏳ Media age for {sender_id}: {age:.2f}s ({entry['media_type']})")
-            if age < 600:  # 10-minute limit
-                recent_media.append(entry)
-
-        if not recent_media:
-            logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
-
-        for entry in recent_media:
-            success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
-            if success:
-                logging.info(f"📁 Linked {entry['media_type']} to ticket #{ticket_id}")
-            else:
-                logging.error(f"❌ Failed to link media to ticket #{ticket_id} for {sender_id}")
-
-        # Clean buffer
-        remaining = [entry for entry in media_list if entry not in recent_media]
-        if remaining:
-            media_buffer[sender_id] = remaining
-        else:
-            media_buffer.pop(sender_id, None)
-
-    # Reset user flow state
-    query_database(
-        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
-        (sender_id,), commit=True
-    )
-
-    send_whatsapp_message(
-        sender_id,
-        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
-    )
-
-    with user_timers_lock:
-        if sender_id in user_timers:
-            del user_timers[sender_id]
 
         
 def mark_user_accepted(whatsapp_number):
