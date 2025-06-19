@@ -1006,9 +1006,6 @@ def manage_upload_timer(sender_id):
 
 
 
-
-
-
 def process_webhook(data):
     """Processes incoming WhatsApp messages from Meta Webhook."""
     
@@ -1049,6 +1046,37 @@ def process_webhook(data):
                             executor.submit(handle_accept, sender_id)
                     continue
 
+                # Handle /start command
+                if normalized == "/start":
+                    # Reset user state in DB
+                    query_database(
+                        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+                        (sender_id,), commit=True
+                    )
+
+                    # Clear temp media from database
+                    query_database(
+                        "DELETE FROM temp_ticket_media WHERE sender_id = %s",
+                        (sender_id,), commit=True
+                    )
+
+                    # Clear in-memory state
+                    with user_timers_lock:
+                        user_timers.pop(sender_id, None)
+                        upload_state.pop(sender_id, None)
+
+                    with media_buffer_lock:
+                        media_buffer.pop(sender_id, None)
+
+                    with terms_pending_lock:
+                        terms_pending_users.pop(sender_id, None)
+                        temp_opt_in_data.pop(sender_id, None)
+
+                    send_whatsapp_message(sender_id, "🔄 We've reset your session. Tap '📝 Create Ticket' to begin.")
+                    send_whatsapp_buttons(sender_id)
+                    continue
+
+
                 # Deduplicate
                 if not is_valid_message(sender_id, message_id, message_text):
                     logging.info(f"Invalid/duplicate message for {sender_id}")
@@ -1075,6 +1103,17 @@ def process_webhook(data):
                     else:
                         send_whatsapp_message(sender_id, "⚠️ Provide upload number (e.g., /remove_upload 1)")
                     continue
+                if normalized == "/cancel":
+                    query_database(
+                        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+                        (sender_id,), commit=True
+                    )
+                    with user_timers_lock:
+                        user_timers.pop(sender_id, None)
+                        upload_state.pop(sender_id, None)
+                    send_whatsapp_message(sender_id, "❌ Your current session has been cancelled. Type /start to begin a new ticket.")
+                    continue
+
 
                 # Fallback: handle based on user flow status
                 user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
@@ -1087,11 +1126,20 @@ def process_webhook(data):
                 property_id = user_info[0]["property_id"]
 
                 if last_action == "awaiting_category":
-                    handle_category_selection(sender_id, message_text)
+                    send_whatsapp_message(sender_id, "⚠️ Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣ to select a category.")
+                    send_category_prompt(sender_id)
+
                 elif last_action == "awaiting_issue_description":
-                    handle_ticket_creation(sender_id, message_text, property_id)
+                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a supporting file.")
+
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
+
                 else:
-                    send_whatsapp_message(sender_id, "🤖 Sorry, I didn't understand that. Please choose an option from the menu.")
+                    send_whatsapp_message(
+                        sender_id,
+                        "🤖 I didn’t understand that message.\n\nIf you need help:\n- Tap a button below\n- Or type /start to begin again"
+                    )
+                    send_whatsapp_buttons(sender_id)
+
     purge_expired_items()
