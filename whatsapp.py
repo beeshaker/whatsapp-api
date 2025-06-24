@@ -1130,7 +1130,7 @@ def process_webhook(data):
                     send_category_prompt(sender_id)
 
                 elif last_action == "awaiting_issue_description":
-                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a supporting file.")
+                    send_whatsapp_message(sender_id, "✏️ Please describe your issue.\n📎 If you wish to upload a file, please do so before describing your issue.\n⏳ Note: File uploads may take a while to process.")
 
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
