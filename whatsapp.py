@@ -867,21 +867,46 @@ def handle_clear_attachments(sender_id):
             executor.submit(send_whatsapp_message, sender_id, "📎 You have no pending attachments.")
         
         
-def handle_category_selection(sender_id: str, message_text: str):
-    category_name = get_category_name(message_text)
+def handle_category_selection(sender_id, category_option):
+    category_mapping = {
+        "1": "Maintenance",
+        "2": "Cleaning",
+        "3": "Caretaker",
+        "4": "Other"
+    }
+
+    category_name = category_mapping.get(category_option)
+
     if category_name:
-        query_database(
-            "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
-            (category_name, sender_id), commit=True
-        )
-        with user_timers_lock:
-            if sender_id in user_timers:
-                del user_timers[sender_id]
-                logging.info(f"Cancelled category selection timer for {sender_id}")
-        send_whatsapp_message(sender_id, "Please describe your issue or upload a supporting file.")
+        try:
+            # Store category temporarily in cache or database if needed
+            temp_ticket_data[sender_id] = {
+                "category": category_name,
+                "media": [],
+                "description": ""
+            }
+
+            # Send the next prompt to the user (asynchronously)
+            executor.submit(
+                send_whatsapp_message,
+                sender_id,
+                "✏️ Please describe your issue.\n📎 If you wish to upload a file, please do so before describing your issue.\n⏳ Note: File uploads may take a while to process."
+            )
+
+        except Exception as e:
+            logging.error(f"Error handling category selection for {sender_id}: {e}")
+            executor.submit(
+                send_whatsapp_message,
+                sender_id,
+                "⚠️ Something went wrong. Please try again."
+            )
     else:
-        send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
-        send_category_prompt(sender_id)
+        executor.submit(
+            send_whatsapp_message,
+            sender_id,
+            "❌ Invalid category selection. Please choose a valid option."
+        )
+
         
         
 
