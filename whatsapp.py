@@ -821,6 +821,7 @@ def handle_category_selection(sender_id: str, message_text: str):
     else:
         send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
+    
         
         
 
@@ -1065,6 +1066,14 @@ def process_webhook(data):
                 property_id = user_info[0]["property_id"]
 
                 if last_action == "awaiting_category":
+                    # Reset the timer for category selection
+                    with user_timers_lock:
+                        user_timers[sender_id] = datetime.now()
+                        logging.info(f"🔁 Category timer reset for {sender_id}")
+                    
+                    # Start/reset expiry thread if needed
+                    threading.Thread(target=reset_category_selection, args=(sender_id,), daemon=True).start()
+
                     handle_category_selection(sender_id, message_text)
 
                 elif last_action == "awaiting_issue_description":
