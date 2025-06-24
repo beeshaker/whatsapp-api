@@ -878,7 +878,7 @@ def handle_category_selection(sender_id: str, message_text: str):
             if sender_id in user_timers:
                 del user_timers[sender_id]
                 logging.info(f"Cancelled category selection timer for {sender_id}")
-        send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a supporting file. \n\n Please allow 60 seconds for the file to upload")
+        send_whatsapp_message(sender_id, "Please describe your issue or upload a supporting file.")
     else:
         send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
@@ -1130,7 +1130,7 @@ def process_webhook(data):
                     send_category_prompt(sender_id)
 
                 elif last_action == "awaiting_issue_description":
-                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a supporting file. \n\n Please allow 60 seconds for the file to upload")
+                    send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a supporting file.")
 
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
