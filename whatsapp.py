@@ -843,7 +843,8 @@ def handle_done_command(sender_id):
     if count == 0:
         executor.submit(send_whatsapp_message, sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
     else:
-        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded {count} file(s). Please describe your issue to proceed.")
+        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded *{media_count}* file(s).\nAre you done uploading attachments? Reply /done to confirm or send more files.")
+        
 
     if user_data and user_data[0]["temp_category"]:
         query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
@@ -878,7 +879,8 @@ def handle_category_selection(sender_id: str, message_text: str):
             if sender_id in user_timers:
                 del user_timers[sender_id]
                 logging.info(f"Cancelled category selection timer for {sender_id}")
-        send_whatsapp_message(sender_id, "Please describe your issue or upload a supporting file.")
+        send_whatsapp_message(sender_id, "✏️ Please describe your issue.\n\n📎 If you wish to upload a file, please do so before describing your issue.\n\n⏳ Note: You may only upload 1 File at a time. \n\n File uploads may take a while to process.")
+
     else:
         send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
