@@ -789,12 +789,17 @@ def handle_done_command(sender_id):
 
     if user_data and user_data[0]["temp_category"]:
         query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+
         if count == 0:
-            executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
+            prompt = "✏️ Please describe your issue.\n📎 If you wish to upload a file, please do so before describing your issue.\n⏳ Note: File uploads may take a while to process."
+            last_msg = last_messages.get(sender_id, ("", 0))[0]
+            if last_msg != prompt:
+                executor.submit(send_whatsapp_message, sender_id, prompt)
     else:
         query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please select a category first.")
         executor.submit(send_category_prompt, sender_id)
+
 
 
 
