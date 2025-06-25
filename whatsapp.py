@@ -110,25 +110,28 @@ def send_category_prompt(to):
 
     
 def reset_category_selection(to: str):
-    time.sleep(300)  # 5 minutes
-    with user_timers_lock:
-        last_attempt_time = user_timers.get(to)
-        if not last_attempt_time:
-            return
-        elapsed_time = (datetime.now() - last_attempt_time).total_seconds()
-        if elapsed_time < 300:
-            return
-        del user_timers[to]
+    time.sleep(300)  # Wait 5 minutes
 
     user_info = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (to,))
     if user_info and user_info[0]["last_action"] != "awaiting_category":
         logging.info(f"Skipping reset for {to}: last_action={user_info[0]['last_action']}")
+        with user_timers_lock:
+            user_timers.pop(to, None)
         return
 
     logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
-    query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
-    send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
-    
+    query_database(
+        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+        (to,), commit=True
+    )
+
+    with user_timers_lock:
+        user_timers.pop(to, None)
+
+    send_whatsapp_message(to, "⏳ You took too long to choose a category. Please tap '📝 Create Ticket' to start again.")
+
+
+
 def send_terms_prompt(sender_id):
     terms_url = os.getenv("TERMS_URL", "https://digiagekenya.com/apricot/TermsofService.html")
     privacy_url = os.getenv("PRIVACY_URL", "https://digiagekenya.com/apricot/policy.html")
