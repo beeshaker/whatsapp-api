@@ -1079,7 +1079,7 @@ def process_webhook(data):
                 
                 if normalized == "/cancel":
                     handle_cancel_command(sender_id)
-                    continue
+                    return
 
                 # Handle commands
                 if normalized == "/clear_attachments":
