@@ -1010,6 +1010,18 @@ def manage_upload_timer(sender_id):
             upload_state[sender_id] = upload_state.get(sender_id, {"media_count": count, "last_upload_time": time.time()})
             upload_state[sender_id]["timer"] = t
             t.start()
+            
+            
+def handle_cancel_command(sender_id):
+    # Delete uploaded media for the user
+    query_database("DELETE FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    
+    # Reset user status
+    query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,))
+
+    # Send confirmation message
+    send_whatsapp_message(sender_id, "🚫 Your process has been cancelled. All uploaded files have been deleted and your progress reset. Send 'Hi' to start again.")
+
 
 
 
@@ -1063,6 +1075,10 @@ def process_webhook(data):
 
                 # Handle media uploads via cleaner handler
                 if handle_media_upload(message, sender_id, message_text):
+                    continue
+                
+                if normalized == "/cancel":
+                    handle_cancel_command(sender_id)
                     continue
 
                 # Handle commands
