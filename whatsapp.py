@@ -306,7 +306,7 @@ def send_whatsapp_tickets(to):
         SELECT id, LEFT(issue_description, 50) AS short_description, updated_at as last_update
         FROM tickets 
         WHERE user_id = (SELECT id FROM users WHERE whatsapp_number = %s) 
-        AND status = 'Open'
+        status NOT IN ('Resolved')
     """
     tickets = query_database(query, (to,))
 
