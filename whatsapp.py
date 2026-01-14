@@ -10,12 +10,19 @@ from dotenv import load_dotenv
 from conn1 import get_db_connection1, save_ticket_media, insert_ticket_and_get_id, mark_user_accepted_via_temp_table
 from sqlalchemy.sql import text
 from threading import Timer
-from datetime import datetime
+
 from concurrent.futures import ThreadPoolExecutor
 import re
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+KENYA_TZ = ZoneInfo("Africa/Nairobi")
+
+def kenya_now():
+    return datetime.now(KENYA_TZ)
 
 
 #image uploading finally works  
@@ -103,7 +110,7 @@ def send_category_prompt(to):
 
     # Safely record the timestamp
     with user_timers_lock:
-        user_timers[to] = datetime.now()
+        user_timers[to] = kenya_now()
 
     threading.Thread(target=reset_category_selection, args=(to,), daemon=True).start()
 
@@ -115,7 +122,7 @@ def reset_category_selection(to: str):
         last_attempt_time = user_timers.get(to)
         if not last_attempt_time:
             return
-        elapsed_time = (datetime.now() - last_attempt_time).total_seconds()
+        elapsed_time = (kenya_now() - last_attempt_time).total_seconds()
         if elapsed_time < 300:
             return
         del user_timers[to]
@@ -415,7 +422,7 @@ def download_media(media_id, filename=None):
     media_file_response = requests.get(media_url, headers=headers)
     if media_file_response.status_code != 200:
         return {"error": "Failed to download media", "details": media_file_response.text}
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
     if not filename:
         filename = f"{media_id}_{timestamp}.bin"
     else:
@@ -742,7 +749,7 @@ def handle_media_upload(message, sender_id, message_text):
         media_id = message[media_type]["id"]
         base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
         name, ext = os.path.splitext(base_filename)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
         filename = f"{name}_{timestamp}{ext}"
         # Submit and wait for completion
         future = executor.submit(process_media_upload, media_id, filename, sender_id, media_type, None)
