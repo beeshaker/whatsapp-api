@@ -7,48 +7,53 @@ import logging
 import threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from conn1 import get_db_connection1, save_ticket_media, insert_ticket_and_get_id, mark_user_accepted_via_temp_table
+from conn1 import (
+    get_db_connection1,
+    save_ticket_media,
+    insert_ticket_and_get_id,
+    mark_user_accepted_via_temp_table,
+)
 from sqlalchemy.sql import text
 from threading import Timer
-
 from concurrent.futures import ThreadPoolExecutor
-import re
-import logging
 from logging.handlers import RotatingFileHandler
-import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# -----------------------------------------------------------------------------
+# Timezone (Kenya)
+# -----------------------------------------------------------------------------
 KENYA_TZ = ZoneInfo("Africa/Nairobi")
 
-def kenya_now():
+
+def kenya_now() -> datetime:
     return datetime.now(KENYA_TZ)
 
 
-#image uploading finally works  
-
-# Create logs directory if not exists
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 os.makedirs("logs", exist_ok=True)
-
-# Log file path
 log_file = "logs/app.log"
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5),  # Rotate at 5MB, keep 5 files
-        logging.StreamHandler()  # Also log to console
-    ]
+        RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5),
+        logging.StreamHandler(),
+    ],
 )
 
-# Initialize Flask app and executor
+# -----------------------------------------------------------------------------
+# Flask + Executor
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=10)
 
-
-# Load environment variables
+# -----------------------------------------------------------------------------
+# Env
+# -----------------------------------------------------------------------------
 load_dotenv()
 WHATSAPP_ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -57,30 +62,33 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 
-# Threading locks
+# -----------------------------------------------------------------------------
+# Locks
+# -----------------------------------------------------------------------------
 media_buffer_lock = threading.Lock()
 user_timers_lock = threading.Lock()
 terms_pending_lock = threading.Lock()
-
-# In-memory storage
-processed_message_ids = set()
-last_messages = {}  # { sender_id: (message_text, timestamp) }
-media_buffer = {}  # { sender_id: [{ media_type, media_path, caption, timestamp }] }
-upload_state = {}  # { sender_id: { timer, last_upload_time, media_count } }
-terms_pending_users = {}  # sender_id: timestamp
-temp_opt_in_data = {}
-# Tracks retry attempts and timer objects per user
-accept_retry_state = {}  # { sender_id: { 'attempt': int, 'timer': Timer } }
 accept_lock = threading.Lock()
 
-# In-memory storage to track processed messages
-user_timers = {}
-upload_prompt_timers = {}  # key: sender_id, value: Timer
-# Media buffer TTL (15 minutes)
-MEDIA_TTL_SECONDS = 900
+# -----------------------------------------------------------------------------
+# In-memory state
+# -----------------------------------------------------------------------------
+processed_message_ids = set()
+last_messages = {}          # { sender_id: (message_text, timestamp_epoch) }
+media_buffer = {}           # legacy buffer (kept, but you now store uploads in DB)
+upload_state = {}           # { sender_id: { timer, last_upload_time, media_count } }
+terms_pending_users = {}    # { sender_id: timestamp_epoch }
+temp_opt_in_data = {}       # { sender_id: { name, property_id, unit_number } }
+accept_retry_state = {}     # { sender_id: { 'attempt': int, 'timer': Timer } }
 
+user_timers = {}            # { sender_id: datetime_kenya }
+upload_prompt_timers = {}   # (unused, but kept if referenced elsewhere)
 
-# Function to connect to MySQL and execute queries
+MEDIA_TTL_SECONDS = 900  # 15 minutes
+
+# -----------------------------------------------------------------------------
+# DB helper
+# -----------------------------------------------------------------------------
 def query_database(query, params=(), commit=False):
     try:
         conn = mysql.connector.connect(
@@ -100,22 +108,28 @@ def query_database(query, params=(), commit=False):
     except mysql.connector.Error as err:
         logging.error(f"Database error: {err}")
         return None
-    
-    
+
+
+# -----------------------------------------------------------------------------
+# Category prompt + timeout
+# -----------------------------------------------------------------------------
 def send_category_prompt(to):
-    """Asks the user to select a category for the ticket."""
-    message = "Please select a category:\n1️⃣ Accounts\n2️⃣ Maintenance\n3️⃣ Security\n4️⃣ Other\n\nReply with the number."
+    message = (
+        "Please select a category:\n"
+        "1️⃣ Accounts\n"
+        "2️⃣ Maintenance\n"
+        "3️⃣ Security\n"
+        "4️⃣ Other\n\n"
+        "Reply with the number."
+    )
     executor.submit(send_whatsapp_message, to, message)
 
-
-    # Safely record the timestamp
     with user_timers_lock:
         user_timers[to] = kenya_now()
 
     threading.Thread(target=reset_category_selection, args=(to,), daemon=True).start()
 
 
-    
 def reset_category_selection(to: str):
     time.sleep(300)  # 5 minutes
     with user_timers_lock:
@@ -127,46 +141,53 @@ def reset_category_selection(to: str):
             return
         del user_timers[to]
 
-    user_info = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (to,))
+    user_info = query_database(
+        "SELECT last_action FROM users WHERE whatsapp_number = %s", (to,)
+    )
     if user_info and user_info[0]["last_action"] != "awaiting_category":
         logging.info(f"Skipping reset for {to}: last_action={user_info[0]['last_action']}")
         return
 
     logging.info(f"⏳ Resetting category selection for {to} due to timeout.")
-    query_database("UPDATE users SET last_action = NULL WHERE whatsapp_number = %s", (to,), commit=True)
-    send_whatsapp_message(to, "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.")
-    
+    query_database(
+        "UPDATE users SET last_action = NULL WHERE whatsapp_number = %s",
+        (to,),
+        commit=True,
+    )
+    send_whatsapp_message(
+        to,
+        "⏳ Your category selection request has expired. Please start again by selecting '📝 Create Ticket'.",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Terms prompt / opt-in route
+# -----------------------------------------------------------------------------
 def send_terms_prompt(sender_id):
     terms_url = os.getenv("TERMS_URL", "https://digiagekenya.com/apricot/TermsofService.html")
     privacy_url = os.getenv("PRIVACY_URL", "https://digiagekenya.com/apricot/policy.html")
 
-    # Use a pre-approved WhatsApp template for initial contact
-    template_name = "registration_welcome"  # Ensure this template is approved in WhatsApp Business API
+    template_name = "registration_welcome"
     template_parameters = [terms_url, privacy_url]
 
     response = send_template_message(sender_id, template_name, template_parameters)
     if response.get("messages"):
         terms_pending_users[sender_id] = time.time()
         logging.info(f"Sent terms template to {sender_id}: {response}")
-        logging.info(terms_pending_users)
     else:
         logging.error(f"Failed to send terms template to {sender_id}: {response}")
-        # Optionally, notify admin or retry
-        
 
 
-@app.route('/opt_in_user', methods=['POST'])
+@app.route("/opt_in_user", methods=["POST"])
 def opt_in_user_route():
     if request.headers.get("X-API-KEY") != os.getenv("INTERNAL_API_KEY"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
+    data = request.json or {}
     name = data.get("name")
     whatsapp_number = data.get("whatsapp_number")
     property_id = data.get("property_id")
     unit_number = data.get("unit_number")
-    
-    
 
     if not all([name, whatsapp_number, property_id, unit_number]):
         logging.error("Missing fields in opt-in request.")
@@ -174,12 +195,10 @@ def opt_in_user_route():
 
     logging.info(f"Storing opt-in data for {whatsapp_number}: {name}, {property_id}, {unit_number}")
 
-    # ✅ Add both temp data and pending terms state
-    
     temp_opt_in_data[whatsapp_number] = {
         "name": name,
         "property_id": property_id,
-        "unit_number": unit_number
+        "unit_number": unit_number,
     }
     terms_pending_users[whatsapp_number] = time.time()
 
@@ -187,75 +206,57 @@ def opt_in_user_route():
     return jsonify({"status": "terms_sent"}), 200
 
 
-
-
-
-
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def get_category_name(category_number):
-    categories = {
-        "1": "Accounts",
-        "2": "Maintenance",
-        "3": "Security",
-        "4": "Other"  # ✅ Added new option
-    }
+    categories = {"1": "Accounts", "2": "Maintenance", "3": "Security", "4": "Other"}
     return categories.get(category_number, None)
 
 
-# Prevent duplicate message processing
 def is_message_processed(message_id):
-    """Check if a message ID has already been processed."""
     if message_id in processed_message_ids:
         return True
-    query = "SELECT id FROM processed_messages WHERE id = %s"
-    result = query_database(query, (message_id,))
+    result = query_database("SELECT id FROM processed_messages WHERE id = %s", (message_id,))
     return bool(result)
 
+
 def mark_message_as_processed(message_id):
-    """Mark a message as processed (in-memory & database)."""
-    processed_message_ids.add(message_id)  # ✅ Immediate in-memory tracking
-    query = "INSERT IGNORE INTO processed_messages (id) VALUES (%s)"
-    query_database(query, (message_id,), commit=True)
+    processed_message_ids.add(message_id)
+    query_database("INSERT IGNORE INTO processed_messages (id) VALUES (%s)", (message_id,), commit=True)
+
 
 def should_process_message(sender_id, message_text):
-    """Check if the last message was identical within 3 seconds."""
-    global last_messages
     current_time = time.time()
-
     if sender_id in last_messages:
         last_text, last_time = last_messages[sender_id]
-        
-        # Ignore duplicate messages within 3 seconds
         if last_text == message_text and (current_time - last_time) < 3:
             logging.info(f"⚠️ Ignoring duplicate message from {sender_id} within 3 seconds.")
             return False
-
-    # ✅ Store this message as the last message
     last_messages[sender_id] = (message_text, current_time)
     return True
+
 
 def is_registered_user(whatsapp_number):
     engine = get_db_connection1()
     with engine.connect() as conn:
         user_check = conn.execute(
             text("SELECT id FROM users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number}
+            {"whatsapp_number": whatsapp_number},
         ).fetchone()
         admin_check = conn.execute(
             text("SELECT id FROM admin_users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number}
+            {"whatsapp_number": whatsapp_number},
         ).fetchone()
     return user_check is not None or admin_check is not None
-    
-    
 
 
-
+# -----------------------------------------------------------------------------
+# WhatsApp messaging
+# -----------------------------------------------------------------------------
 def send_whatsapp_buttons(to):
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -265,20 +266,8 @@ def send_whatsapp_buttons(to):
             "body": {"text": "What would you like to do?"},
             "action": {
                 "buttons": [
-                    {
-                        "type": "reply",
-                        "reply": {
-                            "id": "create_ticket",
-                            "title": "📝 Create Ticket",
-                        },
-                    },
-                    {
-                        "type": "reply",
-                        "reply": {
-                            "id": "check_ticket",
-                            "title": "📌 Check Status",
-                        },
-                    },
+                    {"type": "reply", "reply": {"id": "create_ticket", "title": "📝 Create Ticket"}},
+                    {"type": "reply", "reply": {"id": "check_ticket", "title": "📌 Check Status"}},
                 ]
             },
         },
@@ -287,74 +276,70 @@ def send_whatsapp_buttons(to):
     logging.info(f"Sent WhatsApp interactive buttons: {response.json()}")
     return response.json()
 
-# Send a WhatsApp message
+
 def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": message},
-    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
     response = requests.post(url, headers=headers, json=payload)
     logging.info(f"Sent WhatsApp message: {response.json()}")
     return response.json()
 
 
 def send_whatsapp_tickets(to):
-    """Fetches and sends open tickets for the client via WhatsApp."""
     message = ""
-    # Fetch open tickets for the given WhatsApp number
+
     query = """
-        SELECT id, LEFT(issue_description, 50) AS short_description, updated_at as last_update
-        FROM tickets 
-        WHERE user_id = (SELECT id FROM users WHERE whatsapp_number = %s) 
-        status NOT IN ('Resolved')
+        SELECT 
+            id,
+            LEFT(issue_description, 50) AS short_description,
+            status,
+            COALESCE(updated_at, created_at) AS last_update
+        FROM tickets
+        WHERE user_id = (SELECT id FROM users WHERE whatsapp_number = %s)
+          AND LOWER(status) IN ('open', 'in progress')
+        ORDER BY COALESCE(updated_at, created_at) DESC
+        LIMIT 20
     """
     tickets = query_database(query, (to,))
 
-    # If no open tickets found
     if not tickets:
-        message = "You have no open tickets at the moment."
-        
+        message = "You have no open or in-progress tickets at the moment."
     else:
-        message = "Your open tickets:\n"
+        message = "Your active tickets (Open / In Progress):\n\n"
         for ticket in tickets:
-            message += f"Ticket ID: {ticket['id']}\nDescription: {ticket['short_description']}\nLast Update on: {ticket['last_update']}\n\n"
-    
-    executor.submit(send_whatsapp_message, to, message)
- 
-    
+            message += (
+                f"Ticket ID: {ticket['id']}\n"
+                f"Status: {ticket['status']}\n"
+                f"Description: {ticket['short_description']}\n"
+                f"Last Update on: {ticket['last_update']}\n\n"
+            )
+
+    send_whatsapp_message(to, message)
 
 
-# Webhook route to handle incoming messages
+
+# -----------------------------------------------------------------------------
+# Webhook routes
+# -----------------------------------------------------------------------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        verify_token = "12345"  # Make sure this matches your Meta settings
+        verify_token = "12345"
         if request.args.get("hub.verify_token") == verify_token:
             return request.args.get("hub.challenge"), 200
         return "Invalid verification token", 403
 
-    # POST: Handle webhook events
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
-
-    # ✅ Process inline to prevent duplicate processing
-    executor.submit(process_webhook, data)  # <- correct: submit the function + argument
-
-
+    executor.submit(process_webhook, data)
     return jsonify({"status": "received"}), 200
 
 
 @app.route("/send_message", methods=["POST"])
 def external_send_message():
-    data = request.get_json()
-    api_key = request.headers.get("X-API-KEY")  # Optional security
+    data = request.get_json() or {}
+    api_key = request.headers.get("X-API-KEY")
 
     if api_key != os.getenv("INTERNAL_API_KEY"):
         return jsonify({"error": "Unauthorized"}), 401
@@ -373,34 +358,29 @@ def external_send_message():
         else:
             result = executor.submit(send_whatsapp_message, to, message)
 
-
         return jsonify(result), 200
-
     except Exception as e:
-        print("❌ Error sending WhatsApp message:", e)
+        logging.error(f"❌ Error sending WhatsApp message: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
-
 
 
 def send_template_message(to, template_name, parameters):
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
         "template": {
             "name": template_name,
-            "language": { "code": "en" },
-            "components": [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": p} for p in parameters]
-            }]
-        }
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in parameters],
+                }
+            ],
+        },
     }
 
     response = requests.post(url, headers=headers, json=payload)
@@ -408,37 +388,46 @@ def send_template_message(to, template_name, parameters):
     return response.json()
 
 
+# -----------------------------------------------------------------------------
+# Media handling
+# -----------------------------------------------------------------------------
 def download_media(media_id, filename=None):
     logging.info(f"Media buffer download media: {media_buffer}")
     meta_url = f"https://graph.facebook.com/v22.0/{media_id}"
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+
     media_response = requests.get(meta_url, headers=headers)
     if media_response.status_code != 200:
         logging.info(f"Downloading media_id={media_id}, filename={filename}")
         return {"error": "Failed to fetch media URL", "details": media_response.text}
+
     media_url = media_response.json().get("url")
     if not media_url:
         return {"error": "Media URL not found"}
+
     media_file_response = requests.get(media_url, headers=headers)
     if media_file_response.status_code != 200:
         return {"error": "Failed to download media", "details": media_file_response.text}
+
     timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
     if not filename:
         filename = f"{media_id}_{timestamp}.bin"
     else:
         name, ext = os.path.splitext(filename)
         filename = f"{name}_{timestamp}{ext}"
+
     save_path = os.path.join("/tmp", filename)
     with open(save_path, "wb") as f:
         f.write(media_file_response.content)
+
     return {"success": True, "path": save_path}
 
 
-                
 def purge_expired_items():
     now = time.time()
 
-    # 🧹 Purge expired media
+    # NOTE: you moved media storage to DB temp_ticket_media, so this legacy in-memory purge is mostly redundant.
+    # Kept as-is, but it won't do much unless something still adds to media_buffer.
     with media_buffer_lock:
         for wa_id, media_list in list(media_buffer.items()):
             fresh_media = []
@@ -456,35 +445,20 @@ def purge_expired_items():
                 logging.info(f"🗑️ All media expired for {wa_id}")
                 send_whatsapp_message(wa_id, "⏳ Your uploaded files have expired. Please start again.")
 
-    # 🧹 Purge expired terms
     with terms_pending_lock:
         expired = [uid for uid, ts in terms_pending_users.items() if now - ts > 1800]
         for uid in expired:
             logging.info(f"🗑️ Purging expired terms prompt for {uid}")
-            del terms_pending_users[uid]
-            if uid in temp_opt_in_data:
-                del temp_opt_in_data[uid]
+            terms_pending_users.pop(uid, None)
+            temp_opt_in_data.pop(uid, None)
             send_whatsapp_message(uid, "⏳ Your session to accept Terms expired. Please try again.")
-
-
-
-
-        
-        
-
-
-        
-        
 
 
 def send_caption_confirmation(phone_number, captions, access_token, phone_number_id):
     url = f"https://graph.facebook.com/v22.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-    caption_text = '\n'.join([f"{i+1}. \"{c.strip()}\"" for i, c in enumerate(captions)])
+    caption_text = "\n".join([f'{i+1}. "{c.strip()}"' for i, c in enumerate(captions)])
 
     payload = {
         "messaging_product": "whatsapp",
@@ -492,28 +466,14 @@ def send_caption_confirmation(phone_number, captions, access_token, phone_number
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {
-                "text": f"📝 Captions extracted:\n\n{caption_text}\n\nDoes this look correct?"
-            },
+            "body": {"text": f"📝 Captions extracted:\n\n{caption_text}\n\nDoes this look correct?"},
             "action": {
                 "buttons": [
-                    {
-                        "type": "reply",
-                        "reply": {
-                            "id": "caption_confirm_yes",
-                            "title": "✅ Yes"
-                        }
-                    },
-                    {
-                        "type": "reply",
-                        "reply": {
-                            "id": "caption_confirm_no",
-                            "title": "❌ No"
-                        }
-                    }
+                    {"type": "reply", "reply": {"id": "caption_confirm_yes", "title": "✅ Yes"}},
+                    {"type": "reply", "reply": {"id": "caption_confirm_no", "title": "❌ No"}},
                 ]
-            }
-        }
+            },
+        },
     }
 
     response = requests.post(url, headers=headers, json=payload)
@@ -523,21 +483,17 @@ def send_caption_confirmation(phone_number, captions, access_token, phone_number
 def is_valid_message(sender_id, message_id, message_text):
     # Allow messages from users pending terms acceptance
     if sender_id in terms_pending_users:
-        logging.info(f"Pending terms: {terms_pending_users}")
         logging.info(f"Allowing message from pending user {sender_id}")
         return True
 
-
-    # Skip duplicate/rapid messages
     if is_message_processed(message_id) or not should_process_message(sender_id, message_text):
         logging.info(f"Message {message_id} is duplicate or rapid for {sender_id}")
         return False
-    
+
     if not is_registered_user(sender_id):
         logging.info(f"Blocked unregistered user: {sender_id}")
         send_whatsapp_message(sender_id, "You are not registered. Please register first.")
         return False
-
 
     mark_message_as_processed(message_id)
     logging.info(f"Message {message_id} marked as processed for {sender_id}")
@@ -545,11 +501,6 @@ def is_valid_message(sender_id, message_id, message_text):
 
 
 def process_media_upload(media_id, filename, sender_id, media_type, message_text):
-    """
-    Handles media upload during ticket creation.
-    Stores uploads in the temp_ticket_media table instead of in-memory buffer.
-    Enforces correct flow: only accept media after category selection.
-    """
     from conn1 import save_temp_media_to_db
 
     user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
@@ -561,7 +512,11 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
     last_action = user_status[0]["last_action"]
     if last_action not in ["awaiting_category", "awaiting_issue_description"]:
         logging.info(f"⚠️ Invalid last_action '{last_action}' for {sender_id} — forcing category prompt.")
-        query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+            (sender_id,),
+            commit=True,
+        )
         send_whatsapp_message(sender_id, "⚠️ Please start by selecting a category first.")
         send_category_prompt(sender_id)
         return
@@ -573,41 +528,62 @@ def process_media_upload(media_id, filename, sender_id, media_type, message_text
         return
 
     caption = message_text.strip() if message_text else "No Caption"
+
+    # NOTE: time correctness for uploaded_at should be handled inside conn1.save_temp_media_to_db
     save_temp_media_to_db(sender_id, media_type, download_result["path"], caption)
 
-    # Count uploads
-    count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    count_result = query_database(
+        "SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s",
+        (sender_id,),
+    )
     media_count = count_result[0]["count"] if count_result else 0
     logging.info(f"📦 Media added for {sender_id}. Total in DB: {media_count}")
 
-    # Start upload prompt and reminder
     with user_timers_lock:
-        upload_state[sender_id] = upload_state.get(sender_id, {"media_count": 0, "last_upload_time": time.time(), "timer": None})
+        upload_state[sender_id] = upload_state.get(
+            sender_id, {"media_count": 0, "last_upload_time": time.time(), "timer": None}
+        )
         upload_state[sender_id]["media_count"] = media_count
         upload_state[sender_id]["last_upload_time"] = time.time()
 
     if media_count == 1:
-        query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+            (sender_id,),
+            commit=True,
+        )
         send_whatsapp_message(sender_id, "✅ File received! Please describe your issue or upload more.")
 
         def prompt_reminder():
             time.sleep(180)
-            status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
+            status = query_database(
+                "SELECT last_action FROM users WHERE whatsapp_number = %s",
+                (sender_id,),
+            )
             if status and status[0]["last_action"] == "awaiting_issue_description":
                 send_whatsapp_message(sender_id, "⏳ Reminder: please describe your issue or use /done.")
 
         threading.Thread(target=prompt_reminder, daemon=True).start()
     else:
-        send_whatsapp_message(sender_id, f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Use /done when ready.")    
+        send_whatsapp_message(
+            sender_id,
+            f"✅ {media_type.capitalize()} received! You've uploaded {media_count} file(s). Use /done when ready.",
+        )
 
 
 def handle_ticket_creation(sender_id, message_text, property_id):
-    current_state = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
+    current_state = query_database(
+        "SELECT last_action FROM users WHERE whatsapp_number = %s",
+        (sender_id,),
+    )
     if current_state and not current_state[0]["last_action"]:
         logging.info(f"🔁 Ticket creation ignored for {sender_id} – state already cleared.")
         return
 
-    user_info = query_database("SELECT id, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+    user_info = query_database(
+        "SELECT id, temp_category FROM users WHERE whatsapp_number = %s",
+        (sender_id,),
+    )
     if not user_info:
         send_whatsapp_message(sender_id, "❌ Error creating ticket. Please try again.")
         return
@@ -615,15 +591,13 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     user_id = user_info[0]["id"]
     category = user_info[0]["temp_category"]
 
-    # === Determine Issue Description ===
-    description = message_text.strip()
+    description = (message_text or "").strip()
     if not description:
-        # Fallback to captions in temp_ticket_media
         media_captions = query_database(
             "SELECT caption FROM temp_ticket_media WHERE sender_id = %s",
-            (sender_id,)
+            (sender_id,),
         )
-        captions = [entry["caption"] for entry in media_captions if entry["caption"] != "No Caption"]
+        captions = [entry["caption"] for entry in (media_captions or []) if entry["caption"] != "No Caption"]
         if captions:
             description = "AUTO-FILLED ISSUE DESCRIPTION:\n\n" + "\n\n".join(captions)
         elif media_captions:
@@ -632,45 +606,47 @@ def handle_ticket_creation(sender_id, message_text, property_id):
             send_whatsapp_message(sender_id, "✏️ Please describe your issue or upload a file.")
             return
 
-    # Clear user state
     query_database(
         "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
-        (sender_id,), commit=True
+        (sender_id,),
+        commit=True,
     )
     with user_timers_lock:
         user_timers.pop(sender_id, None)
 
-    # === Create Ticket ===
+    # NOTE: time correctness for tickets.created_at should be handled inside conn1.insert_ticket_and_get_id
     ticket_id = insert_ticket_and_get_id(user_id, description, category, property_id)
 
-    # === Fetch and Attach Media from DB ===
     recent_media = query_database(
         "SELECT media_type, media_path FROM temp_ticket_media WHERE sender_id = %s",
-        (sender_id,)
+        (sender_id,),
     )
     if recent_media:
         for entry in recent_media:
             success = save_ticket_media(ticket_id, entry["media_type"], entry["media_path"])
             if not success:
                 logging.error(f"❌ Failed to attach media to ticket #{ticket_id}")
-        # Delete after use
-        query_database("DELETE FROM temp_ticket_media WHERE sender_id = %s", (sender_id,), commit=True)
+        query_database(
+            "DELETE FROM temp_ticket_media WHERE sender_id = %s",
+            (sender_id,),
+            commit=True,
+        )
         logging.info(f"🧹 Cleaned temp_ticket_media for {sender_id}")
     else:
         logging.warning(f"⚠️ No recent media found for sender {sender_id} during ticket creation.")
+        recent_media = []
 
-    # === Confirm to user ===
     send_whatsapp_message(
         sender_id,
-        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!"
+        f"✅ Your ticket #{ticket_id} has been created under *{category}* with {len(recent_media)} attachment(s). Our team will get back to you soon!",
     )
 
 
-
-
+# -----------------------------------------------------------------------------
+# Button replies
+# -----------------------------------------------------------------------------
 def handle_button_reply(message, sender_id):
     button_id = message["interactive"]["button_reply"]["id"]
-    
     logging.info(f"🔘 Button clicked: {button_id} by {sender_id}")
 
     if button_id in ["upload_done", "upload_not_done", "caption_confirm_yes", "caption_confirm_no"]:
@@ -692,57 +668,82 @@ def handle_button_reply(message, sender_id):
             executor.submit(send_whatsapp_message, sender_id, "❌ An error occurred during registration. Please contact support.")
 
     elif button_id == "reject_terms":
-        if sender_id in terms_pending_users:
-            del terms_pending_users[sender_id]
-        if sender_id in temp_opt_in_data:
-            del temp_opt_in_data[sender_id]
+        terms_pending_users.pop(sender_id, None)
+        temp_opt_in_data.pop(sender_id, None)
         executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
 
     elif button_id == "create_ticket":
-        query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+            (sender_id,),
+            commit=True,
+        )
         executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "check_ticket":
         executor.submit(send_whatsapp_tickets, sender_id)
 
     elif button_id == "upload_done":
-        user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+        user_data = query_database(
+            "SELECT temp_category FROM users WHERE whatsapp_number = %s",
+            (sender_id,),
+        )
         if user_data and user_data[0]["temp_category"]:
-            query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+                (sender_id,),
+                commit=True,
+            )
             executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
         else:
-            query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+                (sender_id,),
+                commit=True,
+            )
             executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "upload_not_done":
         executor.submit(send_whatsapp_message, sender_id, "👍 Okay, send more files when you're ready.")
 
     elif button_id == "caption_confirm_yes":
-        user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
+        user_data = query_database(
+            "SELECT temp_category FROM users WHERE whatsapp_number = %s",
+            (sender_id,),
+        )
         if user_data and user_data[0]["temp_category"]:
-            query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+                (sender_id,),
+                commit=True,
+            )
             with media_buffer_lock:
                 media_count = len(media_buffer.get(sender_id, []))
-            executor.submit(send_whatsapp_message, sender_id, f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.")
+            executor.submit(
+                send_whatsapp_message,
+                sender_id,
+                f"✅ Captions confirmed! You've uploaded {media_count} file(s). Send more or reply /done to proceed.",
+            )
             manage_upload_timer(sender_id)
         else:
-            query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+                (sender_id,),
+                commit=True,
+            )
             executor.submit(send_category_prompt, sender_id)
 
     elif button_id == "caption_confirm_no":
         executor.submit(send_whatsapp_message, sender_id, "📝 Please upload the files again with corrected captions.")
-        with media_buffer_lock:
-            if sender_id in media_buffer:
-                #del media_buffer[sender_id]
-                pass
         with user_timers_lock:
             if sender_id in upload_state:
                 upload_state[sender_id]["media_count"] = 0
                 upload_state[sender_id]["last_upload_time"] = 0
 
-        
-        
 
+# -----------------------------------------------------------------------------
+# Upload commands
+# -----------------------------------------------------------------------------
 def handle_media_upload(message, sender_id, message_text):
     media_type = message.get("type")
     if media_type in ["document", "image", "video"]:
@@ -751,21 +752,23 @@ def handle_media_upload(message, sender_id, message_text):
         name, ext = os.path.splitext(base_filename)
         timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
         filename = f"{name}_{timestamp}{ext}"
-        # Submit and wait for completion
+
         future = executor.submit(process_media_upload, media_id, filename, sender_id, media_type, None)
-        future.result()  # Synchronize
+        future.result()
         return True
     return False
 
 
-
 def handle_list_uploads(sender_id):
-    media_list = query_database("""
+    media_list = query_database(
+        """
         SELECT media_type, caption FROM temp_ticket_media
         WHERE sender_id = %s
         ORDER BY uploaded_at
-    """, (sender_id,))
-    
+        """,
+        (sender_id,),
+    )
+
     if not media_list:
         send_whatsapp_message(sender_id, "📎 You have no pending uploads.")
         return
@@ -779,47 +782,53 @@ def handle_list_uploads(sender_id):
     send_whatsapp_message(sender_id, message)
 
 
-
 def handle_remove_upload(sender_id, upload_index):
     try:
         index = int(upload_index) - 1
-        media_list = query_database("""
+        media_list = query_database(
+            """
             SELECT id, media_type FROM temp_ticket_media
             WHERE sender_id = %s
             ORDER BY uploaded_at
-        """, (sender_id,))
-        
+            """,
+            (sender_id,),
+        )
+
         if 0 <= index < len(media_list):
             removed = media_list[index]
-            query_database("DELETE FROM temp_ticket_media WHERE id = %s", (removed["id"],), commit=True)
-            executor.submit(send_whatsapp_message, sender_id, f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.")
+            query_database(
+                "DELETE FROM temp_ticket_media WHERE id = %s",
+                (removed["id"],),
+                commit=True,
+            )
+            executor.submit(
+                send_whatsapp_message,
+                sender_id,
+                f"🗑️ Removed {removed['media_type'].capitalize()} from your uploads.",
+            )
         else:
             executor.submit(send_whatsapp_message, sender_id, "⚠️ Invalid upload number.")
     except ValueError:
-        executor.submit(send_whatsapp_message, sender_id, "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).")
+        executor.submit(
+            send_whatsapp_message,
+            sender_id,
+            "⚠️ Please provide a valid upload number (e.g., /remove_upload 1).",
+        )
 
 
-        
-        
-
-
-        
-        
 def send_done_upload_prompt(sender_id):
-    
-    
-    media_count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    media_count_result = query_database(
+        "SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s",
+        (sender_id,),
+    )
     media_count = media_count_result[0]["count"] if media_count_result else 0
 
-    
-
-
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    body_text = f"📎 You've uploaded *{media_count}* file(s).\nAre you done uploading attachments? Reply /done to confirm or send more files."
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    body_text = (
+        f"📎 You've uploaded *{media_count}* file(s).\n"
+        "Are you done uploading attachments? Reply /done to confirm or send more files."
+    )
     payload = {
         "messaging_product": "whatsapp",
         "to": sender_id,
@@ -831,7 +840,7 @@ def send_done_upload_prompt(sender_id):
                 "buttons": [
                     {"type": "reply", "reply": {"id": "upload_done", "title": "✅ Done"}},
                     {"type": "reply", "reply": {"id": "upload_not_done", "title": "➕ Add More"}},
-                ],
+                ]
             },
         },
     }
@@ -840,8 +849,14 @@ def send_done_upload_prompt(sender_id):
 
 
 def handle_done_command(sender_id):
-    user_data = query_database("SELECT temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-    media_count = query_database("SELECT COUNT(*) as count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+    user_data = query_database(
+        "SELECT temp_category FROM users WHERE whatsapp_number = %s",
+        (sender_id,),
+    )
+    media_count = query_database(
+        "SELECT COUNT(*) as count FROM temp_ticket_media WHERE sender_id = %s",
+        (sender_id,),
+    )
     count = media_count[0]["count"] if media_count else 0
 
     logging.info(f"Processing /done for {sender_id}: {count} attachments found")
@@ -853,68 +868,99 @@ def handle_done_command(sender_id):
             logging.info(f"Cancelled upload timer for {sender_id}")
 
     if count == 0:
-        executor.submit(send_whatsapp_message, sender_id, "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.")
+        executor.submit(
+            send_whatsapp_message,
+            sender_id,
+            "📎 You have not uploaded any attachments yet. You can still proceed by describing the issue, or upload files now.",
+        )
     else:
-        executor.submit(send_whatsapp_message, sender_id, f"📎 You've uploaded *{count}* file(s).\nAre you done uploading attachments? Reply /done to confirm or send more files.")
-        
+        executor.submit(
+            send_whatsapp_message,
+            sender_id,
+            f"📎 You've uploaded *{count}* file(s).\nAre you done uploading attachments? Reply /done to confirm or send more files.",
+        )
 
     if user_data and user_data[0]["temp_category"]:
-        query_database("UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
+            (sender_id,),
+            commit=True,
+        )
         if count == 0:
             executor.submit(send_whatsapp_message, sender_id, "✏️ Great! Please describe your issue.")
     else:
-        query_database("UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s", (sender_id,), commit=True)
+        query_database(
+            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+            (sender_id,),
+            commit=True,
+        )
         executor.submit(send_whatsapp_message, sender_id, "⚠️ Please select a category first.")
         executor.submit(send_category_prompt, sender_id)
 
 
-
-    
 def handle_clear_attachments(sender_id):
+    # NOTE: you now store uploads in DB. This only clears legacy in-memory buffer.
     with media_buffer_lock:
         if sender_id in media_buffer:
             count = len(media_buffer[sender_id])
-            #del media_buffer[sender_id]
             executor.submit(send_whatsapp_message, sender_id, f"🗑️ Cleared {count} pending attachment(s).")
         else:
             executor.submit(send_whatsapp_message, sender_id, "📎 You have no pending attachments.")
-        
-        
+
+
 def handle_category_selection(sender_id: str, message_text: str):
     category_name = get_category_name(message_text)
     if category_name:
         query_database(
             "UPDATE users SET last_action = 'awaiting_issue_description', temp_category = %s WHERE whatsapp_number = %s",
-            (category_name, sender_id), commit=True
+            (category_name, sender_id),
+            commit=True,
         )
         with user_timers_lock:
             if sender_id in user_timers:
                 del user_timers[sender_id]
                 logging.info(f"Cancelled category selection timer for {sender_id}")
-        send_whatsapp_message(sender_id, "✏️ Please describe your issue.\n\n📎 If you wish to upload a file, please do so *before describing your issue.*\n\n⏳ Note: You may only *upload 1 File at a time*. \n\n _File uploads may take a while to process._")
 
+        send_whatsapp_message(
+            sender_id,
+            "✏️ Please describe your issue.\n\n"
+            "📎 If you wish to upload a file, please do so *before describing your issue.*\n\n"
+            "⏳ Note: You may only *upload 1 File at a time*.\n\n"
+            "_File uploads may take a while to process._",
+        )
     else:
         send_whatsapp_message(sender_id, "⚠️ Invalid selection. Please reply with 1️⃣, 2️⃣, 3️⃣, or 4️⃣.")
         send_category_prompt(sender_id)
-        
-        
 
 
-
-        
+# -----------------------------------------------------------------------------
+# ✅ TIME FIX HERE: remove NOW() and store Kenya time
+# -----------------------------------------------------------------------------
 def mark_user_accepted(whatsapp_number):
+    """
+    If you ever use this function (you currently use mark_user_accepted_via_temp_table),
+    make sure it writes Kenya time and never NOW().
+    """
     engine = get_db_connection1()
     with engine.connect() as conn:
-        result = conn.execute(text("""
-            SELECT id FROM users WHERE whatsapp_number = :num
-        """), {"num": whatsapp_number}).fetchone()
+        result = conn.execute(
+            text("SELECT id FROM users WHERE whatsapp_number = :num"),
+            {"num": whatsapp_number},
+        ).fetchone()
         if not result:
             raise Exception("User not found in DB")
 
-        conn.execute(text("""
-            UPDATE users SET terms_accepted = 1, terms_accepted_at = NOW()
-            WHERE whatsapp_number = :num
-        """), {"num": whatsapp_number})
+        conn.execute(
+            text(
+                """
+                UPDATE users
+                SET terms_accepted = 1,
+                    terms_accepted_at = :ts
+                WHERE whatsapp_number = :num
+                """
+            ),
+            {"num": whatsapp_number, "ts": kenya_now()},
+        )
         conn.commit()
 
 
@@ -923,14 +969,12 @@ def handle_accept(sender_id):
         logging.info(f"Processing accept for {sender_id}")
         send_whatsapp_message(sender_id, "⏳ We're getting things sorted, this may take a minute or two...")
 
-        # Cancel existing retry if needed
         if sender_id in accept_retry_state:
             retry_info = accept_retry_state.pop(sender_id)
             if retry_info and retry_info["timer"]:
                 retry_info["timer"].cancel()
                 logging.info(f"🛑 Cancelled existing retry timer for {sender_id}.")
 
-        # Check if already registered
         if is_registered_user(sender_id):
             with terms_pending_lock:
                 terms_pending_users.pop(sender_id, None)
@@ -948,10 +992,13 @@ def handle_accept(sender_id):
                     return
 
                 try:
+                    # NOTE: ensure this function uses Kenya time internally (in conn1.py)
                     mark_user_accepted_via_temp_table(sender_id)
+
                     accept_retry_state.pop(sender_id, None)
                     with terms_pending_lock:
                         terms_pending_users.pop(sender_id, None)
+
                     send_whatsapp_message(sender_id, "🎉 You've been registered successfully!")
                 except Exception as e:
                     logging.error(f"❌ Attempt {attempt} failed for {sender_id}: {e}")
@@ -963,34 +1010,27 @@ def handle_accept(sender_id):
                         accept_retry_state.pop(sender_id, None)
                         with terms_pending_lock:
                             terms_pending_users.pop(sender_id, None)
-                        send_whatsapp_message(sender_id, "⚠️ We couldn't finalize your registration. Please try again or contact support.")
+                        send_whatsapp_message(
+                            sender_id,
+                            "⚠️ We couldn't finalize your registration. Please try again or contact support.",
+                        )
 
-        # Start first try after short delay
         timer = Timer(1, try_register, args=[1])
         accept_retry_state[sender_id] = {"attempt": 1, "timer": timer}
         timer.start()
 
 
-
+# -----------------------------------------------------------------------------
+# Message parsing
+# -----------------------------------------------------------------------------
 def extract_message_info(message):
-    """
-    Extracts message ID, sender ID, and message text (or caption) from a WhatsApp message.
-
-    Args:
-        message (dict): The incoming WhatsApp message object.
-
-    Returns:
-        tuple: (message_id, sender_id, message_text)
-    """
     message_id = message.get("id")
     sender_id = message["from"]
     message_text = ""
 
     if "text" in message:
-        # Text message
         message_text = message.get("text", {}).get("body", "").strip()
     elif message.get("type") in ["image", "video", "document"]:
-        # Media message with optional caption
         media_type = message["type"]
         message_text = message[media_type].get("caption", "").strip()
 
@@ -1004,40 +1044,47 @@ def manage_upload_timer(sender_id):
 
         def send_prompt():
             with user_timers_lock:
-                count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+                count_result = query_database(
+                    "SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s",
+                    (sender_id,),
+                )
                 count = count_result[0]["count"] if count_result else 0
                 if count > 1:
                     send_done_upload_prompt(sender_id)
                     upload_state[sender_id]["timer"] = None
 
-        count_result = query_database("SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
+        count_result = query_database(
+            "SELECT COUNT(*) AS count FROM temp_ticket_media WHERE sender_id = %s",
+            (sender_id,),
+        )
         count = count_result[0]["count"] if count_result else 0
         if count > 1:
             t = Timer(10, send_prompt)
-            upload_state[sender_id] = upload_state.get(sender_id, {"media_count": count, "last_upload_time": time.time()})
+            upload_state[sender_id] = upload_state.get(
+                sender_id,
+                {"media_count": count, "last_upload_time": time.time()},
+            )
             upload_state[sender_id]["timer"] = t
             t.start()
-            
-            
+
+
 def handle_cancel_command(sender_id):
-    # Delete uploaded media for the user
-    query_database("DELETE FROM temp_ticket_media WHERE sender_id = %s", (sender_id,))
-    
-    # Reset user status
-    query_database("UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s", (sender_id,))
-
-    # Send confirmation message
-    send_whatsapp_message(sender_id, "🚫 Your process has been cancelled. All uploaded files have been deleted and your progress reset. Send 'Hi' to start again.")
-
-
-
-
+    query_database("DELETE FROM temp_ticket_media WHERE sender_id = %s", (sender_id,), commit=True)
+    query_database(
+        "UPDATE users SET last_action = NULL, temp_category = NULL WHERE whatsapp_number = %s",
+        (sender_id,),
+        commit=True,
+    )
+    send_whatsapp_message(
+        sender_id,
+        "🚫 Your process has been cancelled. All uploaded files have been deleted and your progress reset. Send 'Hi' to start again.",
+    )
 
 
-
+# -----------------------------------------------------------------------------
+# Webhook processor
+# -----------------------------------------------------------------------------
 def process_webhook(data):
-    """Processes incoming WhatsApp messages from Meta Webhook."""
-    
     logging.info(f"Processing webhook data:\n{json.dumps(data, indent=2)}")
 
     if "entry" not in data:
@@ -1054,41 +1101,38 @@ def process_webhook(data):
             for message in value.get("messages", []):
                 message_id, sender_id, message_text = extract_message_info(message)
                 logging.info(f"Message from {sender_id} ({message_id}): {message_text}")
-                logging.debug(f"terms_pending_users: {terms_pending_users}, temp_opt_in_data: {temp_opt_in_data}")
 
-                # Handle button replies
                 if "interactive" in message and "button_reply" in message["interactive"]:
                     handle_button_reply(message, sender_id)
                     continue
 
-                # Normalize message text
                 normalized = message_text.strip().lower() if message_text else ""
 
-                # Handle TOS acceptance
                 if normalized in ["accept", "reject"]:
                     with terms_pending_lock:
                         if normalized == "reject":
                             temp_opt_in_data.pop(sender_id, None)
                             terms_pending_users.pop(sender_id, None)
-                            executor.submit(send_whatsapp_message, sender_id, "❌ You must accept the Terms to use this service.")
+                            executor.submit(
+                                send_whatsapp_message,
+                                sender_id,
+                                "❌ You must accept the Terms to use this service.",
+                            )
                         else:
                             executor.submit(handle_accept, sender_id)
                     continue
 
-                # Deduplicate
                 if not is_valid_message(sender_id, message_id, message_text):
                     logging.info(f"Invalid/duplicate message for {sender_id}")
                     continue
 
-                # Handle media uploads via cleaner handler
                 if handle_media_upload(message, sender_id, message_text):
                     continue
-                
+
                 if normalized == "/cancel":
                     handle_cancel_command(sender_id)
                     return
 
-                # Handle commands
                 if normalized == "/clear_attachments":
                     handle_clear_attachments(sender_id)
                     continue
@@ -1106,9 +1150,14 @@ def process_webhook(data):
                         send_whatsapp_message(sender_id, "⚠️ Provide upload number (e.g., /remove_upload 1)")
                     continue
 
-                # Fallback: handle based on user flow status
-                user_status = query_database("SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s", (sender_id,))
-                user_info = query_database("SELECT property_id FROM users WHERE whatsapp_number = %s", (sender_id,))
+                user_status = query_database(
+                    "SELECT last_action, temp_category FROM users WHERE whatsapp_number = %s",
+                    (sender_id,),
+                )
+                user_info = query_database(
+                    "SELECT property_id FROM users WHERE whatsapp_number = %s",
+                    (sender_id,),
+                )
                 if not user_status or not user_info:
                     send_whatsapp_message(sender_id, "⚠️ You are not registered. Please contact support.")
                     continue
@@ -1123,5 +1172,9 @@ def process_webhook(data):
                 elif normalized in ["hi", "hello", "help", "menu"]:
                     send_whatsapp_buttons(sender_id)
                 else:
-                    send_whatsapp_message(sender_id, "🤖 Sorry, I didn't understand that. Please choose an option from the menu.")
+                    send_whatsapp_message(
+                        sender_id,
+                        "🤖 Sorry, I didn't understand that. Please choose an option from the menu.",
+                    )
+
     purge_expired_items()

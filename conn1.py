@@ -34,7 +34,7 @@ def get_db_connection1():
 def save_ticket_media(ticket_id, media_type, file_path):
     """
     Saves media content (as blob) linked to a ticket in the database.
-    Logs errors if file cannot be read or if database insertion fails.
+    Uses Kenya time if table supports a created_at/uploaded_at column.
     Returns True/False so caller can log failures cleanly.
     """
     try:
@@ -44,9 +44,10 @@ def save_ticket_media(ticket_id, media_type, file_path):
         logging.error(f"❌ Failed to read media file {file_path}: {e}")
         return False
 
+    # If your table DOES NOT have created_at, remove that field + param.
     query = """
-        INSERT INTO ticket_media (ticket_id, media_type, media_path, media_blob)
-        VALUES (:ticket_id, :media_type, :media_path, :media_blob)
+        INSERT INTO ticket_media (ticket_id, media_type, media_path, media_blob, created_at)
+        VALUES (:ticket_id, :media_type, :media_path, :media_blob, :created_at)
     """
 
     try:
@@ -56,7 +57,8 @@ def save_ticket_media(ticket_id, media_type, file_path):
                 "ticket_id": ticket_id,
                 "media_type": media_type,
                 "media_path": file_path,
-                "media_blob": binary_content
+                "media_blob": binary_content,
+                "created_at": kenya_now(),  # ✅ Kenya time
             })
             conn.commit()
 
@@ -97,8 +99,7 @@ def insert_ticket_and_get_id(user_id, description, category, property_id):
         row = conn.execute(get_supervisor, {"property_id": property_id}).fetchone()
         supervisor_id = row[0] if row else None
 
-        # Fallback if property has no supervisor set
-        assigned_admin = supervisor_id if supervisor_id else 6  # or None if your column allows NULL
+        assigned_admin = supervisor_id if supervisor_id else 6
 
         conn.execute(insert_query, {
             "user_id": user_id,
@@ -106,7 +107,7 @@ def insert_ticket_and_get_id(user_id, description, category, property_id):
             "category": category,
             "property_id": property_id,
             "assigned_admin": assigned_admin,
-            "created_at": kenya_now()
+            "created_at": kenya_now(),  # ✅ Kenya time
         })
 
         result = conn.execute(select_query).fetchone()
@@ -125,7 +126,6 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
     engine = get_db_connection1()
     with engine.connect() as conn:
         try:
-            # Step 1: Fetch user info from temporary table
             user = conn.execute(text("""
                 SELECT name, property_id, unit_number
                 FROM temp_opt_in_users
@@ -136,9 +136,8 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
                 raise Exception(f"User {whatsapp_number} not found in temp_opt_in_users")
 
             name, property_id, unit_number = user[0], user[1], user[2]
-            now_ke = kenya_now()
+            now_ke = kenya_now()  # ✅ Kenya time
 
-            # Step 2: Insert or update the user in the main users table
             conn.execute(text("""
                 INSERT INTO users
                     (name, whatsapp_number, property_id, unit_number, terms_accepted, terms_accepted_at)
@@ -152,18 +151,15 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
                 "whatsapp_number": whatsapp_number,
                 "property_id": property_id,
                 "unit_number": unit_number,
-                "terms_accepted_at": now_ke
+                "terms_accepted_at": now_ke,
             })
 
-            # Step 3: Delete from the temp table
             conn.execute(
                 text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"),
-                {"num": whatsapp_number}
+                {"num": whatsapp_number},
             )
 
-            # Step 4: Commit the transaction
             conn.commit()
-
             logging.info(f"✅ Successfully registered and marked terms accepted for user {whatsapp_number}")
 
         except Exception as e:
@@ -176,12 +172,14 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
 def save_temp_media_to_db(sender_id, media_type, media_path, caption):
     """
     Saves a media reference temporarily in the database before ticket creation.
-    Uses Kenya time if your table supports an uploaded_at column; if not, it still works.
+    ✅ IMPORTANT: explicitly writes Kenya time to uploaded_at to avoid DB timezone drift.
     """
+    # If your table DOES NOT have uploaded_at, remove that field + param.
     query = text("""
-        INSERT INTO temp_ticket_media (sender_id, media_type, media_path, caption)
-        VALUES (:sender_id, :media_type, :media_path, :caption)
+        INSERT INTO temp_ticket_media (sender_id, media_type, media_path, caption, uploaded_at)
+        VALUES (:sender_id, :media_type, :media_path, :caption, :uploaded_at)
     """)
+
     try:
         engine = get_db_connection1()
         with engine.connect() as conn:
@@ -189,7 +187,8 @@ def save_temp_media_to_db(sender_id, media_type, media_path, caption):
                 "sender_id": sender_id,
                 "media_type": media_type,
                 "media_path": media_path,
-                "caption": caption
+                "caption": caption,
+                "uploaded_at": kenya_now(),  # ✅ Kenya time
             })
             conn.commit()
             logging.info(f"✅ Temp media saved for {sender_id}: {media_type} -> {media_path}")
