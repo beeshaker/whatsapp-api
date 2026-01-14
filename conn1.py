@@ -52,27 +52,43 @@ def save_ticket_media(ticket_id, media_type, file_path):
 
         
         
-def insert_ticket_and_get_id(user_id, description, category, property):
-    """Inserts a new ticket and returns the auto-incremented ticket ID."""
+def insert_ticket_and_get_id(user_id, description, category, property_id):
     engine = get_db_connection1()
+
+    get_supervisor = text("""
+        SELECT supervisor_id
+        FROM properties
+        WHERE id = :property_id
+        LIMIT 1
+    """)
+
     insert_query = text("""
         INSERT INTO tickets 
         (user_id, issue_description, status, created_at, category, property_id, assigned_admin)
-        VALUES (:user_id, :description, 'Open', NOW(), :category, :property, :assigned_admin)
+        VALUES (:user_id, :description, 'Open', NOW(), :category, :property_id, :assigned_admin)
     """)
+
     select_query = text("SELECT LAST_INSERT_ID() AS id")
 
     with engine.connect() as conn:
+        row = conn.execute(get_supervisor, {"property_id": property_id}).fetchone()
+        supervisor_id = row[0] if row else None
+
+        # Fallback if property has no supervisor set
+        assigned_admin = supervisor_id if supervisor_id else 6  # or None if your column allows NULL
+
         conn.execute(insert_query, {
             "user_id": user_id,
             "description": description,
             "category": category,
-            "property": property,
-            "assigned_admin": 6
+            "property_id": property_id,
+            "assigned_admin": assigned_admin
         })
+
         result = conn.execute(select_query).fetchone()
         conn.commit()
         return result[0]
+
 
 
 
