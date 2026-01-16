@@ -561,9 +561,9 @@ def send_manage_attachments_list(sender_id: str):
                     {
                         "title": "Attachments",
                         "rows": [
-                            {"id": LIST_ATTACH_PREVIEW, "title": "👀 Preview/List attachments"},
-                            {"id": LIST_ATTACH_REMOVE_LAST, "title": "🗑️ Remove last attachment"},
-                            {"id": LIST_ATTACH_CLEAR_ALL, "title": "🧹 Clear all attachments"},
+                            {"id": LIST_ATTACH_PREVIEW, "title": "Preview uploads"},
+                            {"id": LIST_ATTACH_REMOVE_LAST, "title": "Remove last"},
+                            {"id": LIST_ATTACH_CLEAR_ALL, "title": "🧹 Clear all"},
                         ],
                     }
                 ],
