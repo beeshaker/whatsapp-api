@@ -40,16 +40,20 @@ DB_URI = (
 )
 
 # Optional: create one engine (reused) instead of creating a new one per call
+import threading
 _ENGINE = None
+_ENGINE_LOCK = threading.Lock()
 
 def get_db_connection1():
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = create_engine(
-            DB_URI,
-            pool_pre_ping=True,
-            pool_recycle=1800,
-        )
+        with _ENGINE_LOCK:
+            if _ENGINE is None:
+                _ENGINE = create_engine(
+                    DB_URI,
+                    pool_pre_ping=True,
+                    pool_recycle=1800,
+                )
     return _ENGINE
 
 # -----------------------------------------------------------------------------
