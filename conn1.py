@@ -1,3 +1,10 @@
+# conn1.py (FULL UPDATED)
+# - Uses NAIVE Kenya time for MySQL (prevents tz-aware datetime insert errors)
+# - Uses engine.begin() for proper commit/rollback
+# - Has a create_engine pool config (optional but recommended)
+# - Improves logging with exc_info=True
+# - Keeps your existing function names/signatures the same so your webhook code doesn’t break
+
 from sqlalchemy import create_engine
 import os
 import logging
@@ -14,8 +21,15 @@ load_dotenv()
 KENYA_TZ = ZoneInfo("Africa/Nairobi")
 
 def kenya_now() -> datetime:
-    """Returns timezone-aware Kenya time."""
+    """Timezone-aware Kenya time (good for logs/UI, NOT for MySQL DATETIME inserts)."""
     return datetime.now(KENYA_TZ)
+
+def kenya_now_db() -> datetime:
+    """
+    Naive Kenya time for DB inserts.
+    MySQL drivers often reject tz-aware datetimes for DATETIME columns.
+    """
+    return datetime.now(KENYA_TZ).replace(tzinfo=None)
 
 # -----------------------------------------------------------------------------
 # Database Connection using SQLAlchemy
@@ -25,8 +39,18 @@ DB_URI = (
     f"@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
 )
 
+# Optional: create one engine (reused) instead of creating a new one per call
+_ENGINE = None
+
 def get_db_connection1():
-    return create_engine(DB_URI)
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(
+            DB_URI,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
+    return _ENGINE
 
 # -----------------------------------------------------------------------------
 # Media: Save final ticket media (blob)
@@ -34,38 +58,36 @@ def get_db_connection1():
 def save_ticket_media(ticket_id, media_type, file_path):
     """
     Saves media content (as blob) linked to a ticket in the database.
-    Uses Kenya time if table supports a created_at/uploaded_at column.
     Returns True/False so caller can log failures cleanly.
     """
     try:
         with open(file_path, "rb") as f:
             binary_content = f.read()
     except Exception as e:
-        logging.error(f"❌ Failed to read media file {file_path}: {e}")
+        logging.error(f"❌ Failed to read media file {file_path}: {e}", exc_info=True)
         return False
 
-    # If your table DOES NOT have created_at, remove that field + param.
-    query = """
+    # NOTE: If your ticket_media table does NOT have created_at or media_path, remove them here.
+    query = text("""
         INSERT INTO ticket_media (ticket_id, media_type, media_path, media_blob, created_at)
         VALUES (:ticket_id, :media_type, :media_path, :media_blob, :created_at)
-    """
+    """)
 
     try:
         engine = get_db_connection1()
-        with engine.connect() as conn:
-            conn.execute(text(query), {
+        with engine.begin() as conn:  # ✅ commit/rollback handled automatically
+            conn.execute(query, {
                 "ticket_id": ticket_id,
                 "media_type": media_type,
                 "media_path": file_path,
                 "media_blob": binary_content,
-                "created_at": kenya_now(),  # ✅ Kenya time
+                "created_at": kenya_now_db(),  # ✅ naive Kenya time
             })
-            conn.commit()
 
         logging.info(f"✅ Media saved for ticket #{ticket_id}: {media_type} -> {file_path}")
         return True
     except Exception as e:
-        logging.error(f"❌ Failed to insert media into database for ticket {ticket_id}: {e}")
+        logging.error(f"❌ Failed to insert media into DB for ticket {ticket_id}: {e}", exc_info=True)
         return False
 
 # -----------------------------------------------------------------------------
@@ -76,7 +98,7 @@ def insert_ticket_and_get_id(user_id, description, category, property_id):
     Inserts a new ticket and returns the auto-incremented ticket ID.
     Assigns the ticket to the property's supervisor_id (property manager).
     Falls back to admin_id=6 if supervisor_id is NULL.
-    Uses Kenya time (not DB server time).
+    Uses naive Kenya time (MySQL-friendly).
     """
     engine = get_db_connection1()
 
@@ -95,24 +117,26 @@ def insert_ticket_and_get_id(user_id, description, category, property_id):
 
     select_query = text("SELECT LAST_INSERT_ID() AS id")
 
-    with engine.connect() as conn:
-        row = conn.execute(get_supervisor, {"property_id": property_id}).fetchone()
-        supervisor_id = row[0] if row else None
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(get_supervisor, {"property_id": property_id}).fetchone()
+            supervisor_id = row[0] if row else None
+            assigned_admin = supervisor_id if supervisor_id else 6
 
-        assigned_admin = supervisor_id if supervisor_id else 6
+            conn.execute(insert_query, {
+                "user_id": user_id,
+                "description": description,
+                "category": category,
+                "property_id": property_id,
+                "assigned_admin": assigned_admin,
+                "created_at": kenya_now_db(),  # ✅ naive Kenya time
+            })
 
-        conn.execute(insert_query, {
-            "user_id": user_id,
-            "description": description,
-            "category": category,
-            "property_id": property_id,
-            "assigned_admin": assigned_admin,
-            "created_at": kenya_now(),  # ✅ Kenya time
-        })
-
-        result = conn.execute(select_query).fetchone()
-        conn.commit()
-        return result[0]
+            result = conn.execute(select_query).fetchone()
+            return int(result[0]) if result else None
+    except Exception as e:
+        logging.error(f"❌ Failed to insert ticket for user_id={user_id}: {e}", exc_info=True)
+        raise
 
 # -----------------------------------------------------------------------------
 # Users: Accept terms via temp table -> main users table
@@ -121,11 +145,12 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
     """
     Moves a user from temp_opt_in_users to users table, and marks terms as accepted.
     If the user already exists, updates their terms_accepted status and timestamp.
-    Uses Kenya time (not DB server time).
+    Uses naive Kenya time (MySQL-friendly).
     """
     engine = get_db_connection1()
-    with engine.connect() as conn:
-        try:
+
+    try:
+        with engine.begin() as conn:
             user = conn.execute(text("""
                 SELECT name, property_id, unit_number
                 FROM temp_opt_in_users
@@ -136,7 +161,7 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
                 raise Exception(f"User {whatsapp_number} not found in temp_opt_in_users")
 
             name, property_id, unit_number = user[0], user[1], user[2]
-            now_ke = kenya_now()  # ✅ Kenya time
+            now_ke = kenya_now_db()  # ✅ naive Kenya time
 
             conn.execute(text("""
                 INSERT INTO users
@@ -159,12 +184,10 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
                 {"num": whatsapp_number},
             )
 
-            conn.commit()
-            logging.info(f"✅ Successfully registered and marked terms accepted for user {whatsapp_number}")
-
-        except Exception as e:
-            logging.error(f"❌ Error while registering user {whatsapp_number}: {e}")
-            raise
+        logging.info(f"✅ Successfully registered and marked terms accepted for user {whatsapp_number}")
+    except Exception as e:
+        logging.error(f"❌ Error while registering user {whatsapp_number}: {e}", exc_info=True)
+        raise
 
 # -----------------------------------------------------------------------------
 # Media: Save temp media references before ticket creation
@@ -172,9 +195,9 @@ def mark_user_accepted_via_temp_table(whatsapp_number):
 def save_temp_media_to_db(sender_id, media_type, media_path, caption):
     """
     Saves a media reference temporarily in the database before ticket creation.
-    ✅ IMPORTANT: explicitly writes Kenya time to uploaded_at to avoid DB timezone drift.
+    Uses naive Kenya time (MySQL-friendly).
     """
-    # If your table DOES NOT have uploaded_at, remove that field + param.
+    # NOTE: If your temp_ticket_media table does NOT have uploaded_at, remove it here.
     query = text("""
         INSERT INTO temp_ticket_media (sender_id, media_type, media_path, caption, uploaded_at)
         VALUES (:sender_id, :media_type, :media_path, :caption, :uploaded_at)
@@ -182,17 +205,17 @@ def save_temp_media_to_db(sender_id, media_type, media_path, caption):
 
     try:
         engine = get_db_connection1()
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(query, {
                 "sender_id": sender_id,
                 "media_type": media_type,
                 "media_path": media_path,
                 "caption": caption,
-                "uploaded_at": kenya_now(),  # ✅ Kenya time
+                "uploaded_at": kenya_now_db(),  # ✅ naive Kenya time
             })
-            conn.commit()
-            logging.info(f"✅ Temp media saved for {sender_id}: {media_type} -> {media_path}")
-            return True
+
+        logging.info(f"✅ Temp media saved for {sender_id}: {media_type} -> {media_path}")
+        return True
     except Exception as e:
-        logging.error(f"❌ Failed to insert temp media for {sender_id}: {e}")
+        logging.error(f"❌ Failed to insert temp media for {sender_id}: {e}", exc_info=True)
         return False
