@@ -72,13 +72,16 @@ terms_pending_lock = threading.Lock()
 accept_lock = threading.Lock()
 attachment_timer_lock = threading.Lock()
 
+# ✅ NEW: per-user upload state lock (prevents race between upload and button press)
+upload_state_lock = threading.Lock()
+
 # -----------------------------------------------------------------------------
 # In-memory state
 # -----------------------------------------------------------------------------
 processed_message_ids = set()
 last_messages = {}          # { sender_id: (message_text, timestamp_epoch) }
 media_buffer = {}           # legacy buffer (kept, but you now store uploads in DB)
-upload_state = {}           # { sender_id: { timer, last_upload_time, media_count } }
+upload_state = {}           # { sender_id: { uploading: bool } }
 terms_pending_users = {}    # { sender_id: timestamp_epoch }
 temp_opt_in_data = {}       # { sender_id: { name, property_id, unit_number } }
 accept_retry_state = {}     # { sender_id: { 'attempt': int, 'timer': Timer } }
@@ -129,6 +132,20 @@ def query_database(query, params=(), commit=False):
     except mysql.connector.Error as err:
         logging.error(f"Database error: {err}")
         return None
+
+
+# -----------------------------------------------------------------------------
+# Upload state helpers (prevents “Describe issue” while upload still processing)
+# -----------------------------------------------------------------------------
+def set_uploading(sender_id: str, uploading: bool):
+    with upload_state_lock:
+        upload_state.setdefault(sender_id, {})
+        upload_state[sender_id]["uploading"] = bool(uploading)
+
+
+def is_uploading(sender_id: str) -> bool:
+    with upload_state_lock:
+        return bool(upload_state.get(sender_id, {}).get("uploading", False))
 
 
 # -----------------------------------------------------------------------------
@@ -235,7 +252,6 @@ def start_or_reset_description_timer(sender_id: str):
     cancel_description_timer(sender_id)
 
     def _expire():
-        # Only expire if user still hasn't created the ticket and still has temp uploads.
         count = get_temp_media_count(sender_id)
         if count <= 0:
             return
@@ -246,7 +262,6 @@ def start_or_reset_description_timer(sender_id: str):
         )
         last_action = st[0]["last_action"] if st else None
 
-        # Only enforce when we're waiting for the issue description
         if last_action == "awaiting_issue_description":
             clear_all_attachments(sender_id, notify=False)
             query_database(
@@ -439,7 +454,6 @@ def send_menu_prompt(to: str, body_text: str):
 
 
 def send_whatsapp_buttons(to):
-    # kept for compatibility (calls menu prompt with default text)
     return send_menu_prompt(to, "What would you like to do?")
 
 
@@ -454,7 +468,6 @@ def send_whatsapp_message(to, message):
 
 def send_whatsapp_tickets(to):
     message = ""
-
     query = """
         SELECT 
             id,
@@ -484,19 +497,25 @@ def send_whatsapp_tickets(to):
     send_whatsapp_message(to, message)
 
 
-def send_attachment_action_buttons(sender_id: str):
+def send_attachment_action_buttons(sender_id: str, note: str | None = None):
     """
     3-button max on WhatsApp.
     Buttons:
       - Add more attachments
       - Describe issue
       - Manage (list: preview/remove last/clear all)
+
+    ✅ FIX: caller can pass `note` so we don't send an extra text message.
     """
     count = get_temp_media_count(sender_id)
+
+    extra = f"\n\n{note}" if note else ""
     body_text = (
-        f"📎 Attachments: *{count}/{MAX_ATTACHMENTS}*\n\n"
+        f"📎 Attachments: *{count}/{MAX_ATTACHMENTS}*"
+        f"{extra}\n\n"
         f"You have *{DESCRIPTION_TTL_SECONDS//60} minutes* to send the issue description "
         "or your uploads will be deleted.\n\n"
+        "📎 If you wish to upload a file, please do so *before describing your issue*.\n\n"
         "Choose an option:"
     )
 
@@ -591,11 +610,11 @@ def external_send_message():
 
     try:
         if template_name:
-            result = executor.submit(send_template_message, to, template_name, template_parameters)
+            executor.submit(send_template_message, to, template_name, template_parameters)
         else:
-            result = executor.submit(send_whatsapp_message, to, message)
+            executor.submit(send_whatsapp_message, to, message)
 
-        return jsonify(result), 200
+        return jsonify({"status": "queued"}), 200
     except Exception as e:
         logging.error(f"❌ Error sending WhatsApp message: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -702,57 +721,71 @@ def is_valid_message(sender_id, message_id, message_text):
 
 
 def process_media_upload(media_id, filename, sender_id, media_type, caption_text):
-    # Attachment limit
-    current_count = get_temp_media_count(sender_id)
-    if current_count >= MAX_ATTACHMENTS:
-        send_whatsapp_message(sender_id, f"⚠️ Max attachments reached ({MAX_ATTACHMENTS}). Please tap *Describe issue*.")
-        send_attachment_action_buttons(sender_id)
-        return
+    # ✅ Mark this sender as “uploading” to block Describe/Ticket creation until complete
+    set_uploading(sender_id, True)
 
-    user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
-    if not user_status:
-        send_whatsapp_message(sender_id, "⚠️ You're not registered. Please register first.")
-        return
+    try:
+        # Attachment limit
+        current_count = get_temp_media_count(sender_id)
+        if current_count >= MAX_ATTACHMENTS:
+            send_whatsapp_message(sender_id, f"⚠️ Max attachments reached ({MAX_ATTACHMENTS}). Please tap *Describe issue*.")
+            send_attachment_action_buttons(sender_id)
+            return
 
-    last_action = user_status[0]["last_action"]
-    if last_action not in ["awaiting_category", "awaiting_issue_description"]:
+        user_status = query_database("SELECT last_action FROM users WHERE whatsapp_number = %s", (sender_id,))
+        if not user_status:
+            send_whatsapp_message(sender_id, "⚠️ You're not registered. Please register first.")
+            return
+
+        last_action = user_status[0]["last_action"]
+        if last_action not in ["awaiting_category", "awaiting_issue_description"]:
+            query_database(
+                "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+                (sender_id,),
+                commit=True,
+            )
+            send_whatsapp_message(sender_id, "⚠️ Please start by selecting a category first.")
+            send_category_prompt(sender_id)
+            return
+
+        download_result = download_media(media_id, filename)
+        if "success" not in download_result:
+            logging.error(f"❌ Download failed for {sender_id}: {download_result}")
+            send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
+            return
+
+        caption = (caption_text or "").strip() or "No Caption"
+
+        ok = save_temp_media_to_db(sender_id, media_type, download_result["path"], caption)
+        if not ok:
+            send_whatsapp_message(sender_id, "❌ Failed to save attachment. Please try again.")
+            return
+
+        # After first attachment we definitely want the user in awaiting_issue_description state
         query_database(
-            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
+            "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
             (sender_id,),
             commit=True,
         )
-        send_whatsapp_message(sender_id, "⚠️ Please start by selecting a category first.")
-        send_category_prompt(sender_id)
-        return
 
-    download_result = download_media(media_id, filename)
-    if "success" not in download_result:
-        logging.error(f"❌ Download failed for {sender_id}: {download_result}")
-        send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
-        return
+        # Reset timer on each upload
+        start_or_reset_description_timer(sender_id)
 
-    caption = (caption_text or "").strip() or "No Caption"
+        # ✅ Buttons (instead of /done)
+        send_attachment_action_buttons(sender_id)
 
-    ok = save_temp_media_to_db(sender_id, media_type, download_result["path"], caption)
-    if not ok:
-        send_whatsapp_message(sender_id, "❌ Failed to save attachment. Please try again.")
-        return
-
-    # After first attachment we definitely want the user in awaiting_issue_description state
-    query_database(
-        "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-        (sender_id,),
-        commit=True,
-    )
-
-    # Reset timer on each upload
-    start_or_reset_description_timer(sender_id)
-
-    # Show buttons (instead of /done)
-    send_attachment_action_buttons(sender_id)
+    finally:
+        # ✅ Upload complete
+        set_uploading(sender_id, False)
 
 
 def handle_ticket_creation(sender_id, message_text, property_id):
+    # ✅ If upload still processing, do NOT create ticket yet
+    if is_uploading(sender_id):
+        send_whatsapp_message(sender_id, "⏳ Please wait — your attachment is still uploading/processing.")
+        send_attachment_action_buttons(sender_id)
+        return
+
     # If they finally typed description, cancel the expiry timer
     cancel_description_timer(sender_id)
 
@@ -846,18 +879,34 @@ def handle_button_reply(message, sender_id):
 
     # Attachment flow
     if button_id == BTN_ATTACH_ADD_MORE:
+        if is_uploading(sender_id):
+            send_whatsapp_message(sender_id, "⏳ Please wait — your previous attachment is still processing.")
+            send_attachment_action_buttons(sender_id)
+            return
+
         count = get_temp_media_count(sender_id)
-        if count >= MAX_ATTACHMENTS:
-            send_whatsapp_message(sender_id, f"⚠️ Max attachments reached ({MAX_ATTACHMENTS}). Tap *Describe issue*.")
-            send_attachment_action_buttons(sender_id)
-        else:
-            send_whatsapp_message(sender_id, "➕ Okay — send the next attachment now.")
-            send_attachment_action_buttons(sender_id)
-        # Timer continues; reset just to be safe
         start_or_reset_description_timer(sender_id)
+
+        # ✅ FIX: DO NOT send a separate text message here.
+        # Just refresh the buttons and show an instruction inside the buttons body.
+        if count >= MAX_ATTACHMENTS:
+            send_attachment_action_buttons(
+                sender_id,
+                note=f"⚠️ Max attachments reached ({MAX_ATTACHMENTS}). Tap *Describe issue* to continue.",
+            )
+        else:
+            send_attachment_action_buttons(
+                sender_id,
+                note="➕ Send the next attachment now (one at a time).",
+            )
         return
 
     if button_id == BTN_ATTACH_DESCRIBE:
+        if is_uploading(sender_id):
+            send_whatsapp_message(sender_id, "⏳ Please wait — your attachment is still uploading/processing.")
+            send_attachment_action_buttons(sender_id)
+            return
+
         query_database(
             "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
             (sender_id,),
@@ -865,35 +914,32 @@ def handle_button_reply(message, sender_id):
         )
         send_whatsapp_message(
             sender_id,
-            f"✍️ Please describe your issue now.\n\n"
+            "✍️ Please describe your issue now.\n\n"
+            "📎 If you wish to upload a file, please do so *before describing your issue*.\n\n"
             f"⏳ You have {DESCRIPTION_TTL_SECONDS//60} minutes from your last upload."
         )
         start_or_reset_description_timer(sender_id)
         return
 
     if button_id == BTN_ATTACH_MANAGE:
+        if is_uploading(sender_id):
+            send_whatsapp_message(sender_id, "⏳ Please wait — your attachment is still uploading/processing.")
+            send_attachment_action_buttons(sender_id)
+            return
+
         send_manage_attachments_list(sender_id)
         start_or_reset_description_timer(sender_id)
-        return
-
-    # Legacy buttons still supported (if you have old templates)
-    if button_id == "create_ticket":
-        query_database(
-            "UPDATE users SET last_action = 'awaiting_category' WHERE whatsapp_number = %s",
-            (sender_id,),
-            commit=True,
-        )
-        executor.submit(send_category_prompt, sender_id)
-        return
-
-    if button_id == "check_ticket":
-        executor.submit(send_whatsapp_tickets, sender_id)
         return
 
 
 def handle_list_reply(message, sender_id):
     item_id = message["interactive"]["list_reply"]["id"]
     logging.info(f"📋 List item selected: {item_id} by {sender_id}")
+
+    if is_uploading(sender_id):
+        send_whatsapp_message(sender_id, "⏳ Please wait — your attachment is still uploading/processing.")
+        send_attachment_action_buttons(sender_id)
+        return
 
     if item_id == LIST_ATTACH_PREVIEW:
         list_attachments(sender_id)
@@ -910,7 +956,6 @@ def handle_list_reply(message, sender_id):
     if item_id == LIST_ATTACH_CLEAR_ALL:
         clear_all_attachments(sender_id, notify=True)
         send_attachment_action_buttons(sender_id)
-        # If no attachments remain, stop timer
         if get_temp_media_count(sender_id) <= 0:
             cancel_description_timer(sender_id)
         return
@@ -923,6 +968,12 @@ def handle_media_upload(message, sender_id, message_text):
     media_type = message.get("type")
     if media_type not in ["document", "image", "video"]:
         return False
+
+    # If an upload is already in flight, tell them to wait (prevents piling up)
+    if is_uploading(sender_id):
+        send_whatsapp_message(sender_id, "⏳ Please wait — your previous attachment is still processing.")
+        send_attachment_action_buttons(sender_id)
+        return True  # we handled it
 
     media_id = message[media_type]["id"]
     base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
@@ -942,7 +993,6 @@ def handle_media_upload(message, sender_id, message_text):
 
 
 def handle_clear_attachments(sender_id):
-    # ✅ Now clears DB uploads + deletes files
     clear_all_attachments(sender_id, notify=True)
     cancel_description_timer(sender_id)
 
@@ -962,11 +1012,13 @@ def handle_category_selection(sender_id: str, message_text: str):
         send_whatsapp_message(
             sender_id,
             "✍️ Please describe your issue.\n\n"
-            "📎 If you want to attach files, send them now (one at a time).\n"
+            "📎 If you wish to upload a file, please do so *before describing your issue*.\n\n"
+            "If you want to attach files, send them now (one at a time).\n"
             f"✅ Max {MAX_ATTACHMENTS} attachments.\n"
-            f"⏳ After uploading, you have {DESCRIPTION_TTL_SECONDS//60} minutes to send the issue description or uploads will be deleted.",
+            f"⏳ After uploading, you have {DESCRIPTION_TTL_SECONDS//60} minutes to send the issue description "
+            "or uploads will be deleted.",
         )
-        # Start timer only if they already have uploads (usually they don't at this stage)
+
         if get_temp_media_count(sender_id) > 0:
             start_or_reset_description_timer(sender_id)
     else:
