@@ -594,18 +594,37 @@ def webhook():
 
 @app.route("/send_message", methods=["POST"])
 def external_send_message():
-    data = request.get_json() or {}
-    api_key = request.headers.get("X-API-KEY")
+    # ✅ PROOF the endpoint was hit (even if auth fails)
+    logging.info("✅ /send_message HIT")
 
-    if api_key != os.getenv("INTERNAL_API_KEY"):
+    data = request.get_json(silent=True) or {}
+    api_key = request.headers.get("X-API-KEY")
+    expected_key = os.getenv("INTERNAL_API_KEY")
+
+    # ✅ Log auth status (so “nothing happens” can’t be silent)
+    if api_key != expected_key:
+        logging.warning(
+            "⛔ Unauthorized /send_message. "
+            f"got={'<missing>' if not api_key else api_key} "
+            f"expected={'<missing>' if not expected_key else expected_key}"
+        )
         return jsonify({"error": "Unauthorized"}), 401
 
+    # ✅ Log payload summary (don’t spam full content)
     to = data.get("to")
     message = data.get("message")
     template_name = data.get("template_name")
     template_parameters = data.get("template_parameters", [])
 
+    logging.info(
+        f"/send_message OK auth | to={to} "
+        f"template_name={template_name} "
+        f"has_message={bool(message)} "
+        f"param_count={len(template_parameters) if isinstance(template_parameters, list) else 'n/a'}"
+    )
+
     if not to or (not message and not template_name):
+        logging.warning(f"⚠️ /send_message Missing fields. keys={list(data.keys())}")
         return jsonify({"error": "Missing required fields"}), 400
 
     try:
@@ -614,10 +633,13 @@ def external_send_message():
         else:
             executor.submit(send_whatsapp_message, to, message)
 
+        logging.info("✅ /send_message queued successfully")
         return jsonify({"status": "queued"}), 200
+
     except Exception as e:
         logging.error(f"❌ Error sending WhatsApp message: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
 
 
 def send_template_message(to, template_name, parameters):
