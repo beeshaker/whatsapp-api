@@ -12,6 +12,8 @@ from conn1 import (
     save_ticket_media,
     insert_ticket_and_get_id,
     mark_user_accepted_via_temp_table,
+    log_whatsapp_message,              # ✅ ADD
+    update_whatsapp_message_status,
     save_temp_media_to_db,   # ✅ IMPORTANT (so we don’t re-import inside)
 )
 from sqlalchemy.sql import text
@@ -461,9 +463,31 @@ def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
+
     response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Sent WhatsApp message: {response.json()}")
-    return response.json()
+    data = response.json()
+    logging.info(f"Sent WhatsApp message: {data}")
+
+    # ✅ Log outbound with wamid if present
+    try:
+        wamid = None
+        if isinstance(data, dict) and data.get("messages"):
+            wamid = data["messages"][0].get("id")
+
+        log_whatsapp_message(
+            wa_number=to,
+            direction="outbound",
+            message_type="text",
+            body_text=message,
+            message_id=wamid,
+            status="sent" if response.status_code in (200, 201) else "failed",
+            error_text=(json.dumps(data) if response.status_code not in (200, 201) else None),
+        )
+    except Exception as e:
+        logging.error(f"Failed to log outbound text: {e}", exc_info=True)
+
+    return data
+
 
 
 def send_whatsapp_tickets(to):
@@ -652,18 +676,36 @@ def send_template_message(to, template_name, parameters):
         "template": {
             "name": template_name,
             "language": {"code": "en"},
-            "components": [
-                {
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": p} for p in parameters],
-                }
-            ],
+            "components": [{"type": "body", "parameters": [{"type": "text", "text": p} for p in parameters]}],
         },
     }
 
     response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Sent WhatsApp template message: {response.json()}")
-    return response.json()
+    data = response.json()
+    logging.info(f"Sent WhatsApp template message: {data}")
+
+    # ✅ Log outbound template
+    try:
+        wamid = None
+        if isinstance(data, dict) and data.get("messages"):
+            wamid = data["messages"][0].get("id")
+
+        log_whatsapp_message(
+            wa_number=to,
+            direction="outbound",
+            message_type="template",
+            body_text=None,
+            template_name=template_name,
+            message_id=wamid,
+            status="sent" if response.status_code in (200, 201) else "failed",
+            error_text=(json.dumps(data) if response.status_code not in (200, 201) else None),
+            meta_json=json.dumps({"params": parameters}, ensure_ascii=False),
+        )
+    except Exception as e:
+        logging.error(f"Failed to log outbound template: {e}", exc_info=True)
+
+    return data
+
 
 
 # -----------------------------------------------------------------------------
@@ -1173,11 +1215,54 @@ def process_webhook(data):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             if "statuses" in value:
+                for stt in value.get("statuses", []):
+                    try:
+                        wamid = stt.get("id")
+                        status = stt.get("status")  # sent/delivered/read/failed
+                        err_txt = None
+                        if stt.get("errors"):
+                            err_txt = json.dumps(stt.get("errors"), ensure_ascii=False)
+
+                        # Update row if exists, otherwise insert a "status" event
+                        try:
+                            update_whatsapp_message_status(wamid, status=status, error_text=err_txt)
+                        except Exception:
+                            pass
+
+                        # Optional: also store status event as its own line
+                        log_whatsapp_message(
+                            wa_number=(stt.get("recipient_id") or "unknown"),
+                            direction="outbound",
+                            message_type="status",
+                            body_text=None,
+                            message_id=wamid,
+                            status=status,
+                            error_text=err_txt,
+                            meta_json=json.dumps(stt, ensure_ascii=False),
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to log status: {e}", exc_info=True)
                 continue
+
 
             for message in value.get("messages", []):
                 message_id, sender_id, message_text = extract_message_info(message)
                 logging.info(f"Message from {sender_id} ({message_id}): {message_text}")
+
+                # ✅ Log inbound (raw)
+                try:
+                    mtype = message.get("type", "text")
+                    log_whatsapp_message(
+                        wa_number=sender_id,
+                        direction="inbound",
+                        message_type=mtype,
+                        body_text=message_text or None,
+                        message_id=message_id,
+                        meta_json=json.dumps({"type": mtype}, ensure_ascii=False),
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to log inbound message: {e}", exc_info=True)
+
 
                 # Handle button replies
                 if "interactive" in message and "button_reply" in message["interactive"]:

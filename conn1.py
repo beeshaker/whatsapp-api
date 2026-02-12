@@ -273,3 +273,64 @@ def save_temp_media_to_db(sender_id, media_type, media_path, caption):
             exc_info=True,
         )
         return False
+
+
+# conn1.py (ADD THIS BELOW YOUR EXISTING FUNCTIONS)
+
+def log_whatsapp_message(
+    wa_number: str,
+    direction: str,          # "inbound" | "outbound"
+    message_type: str,       # "text" | "interactive" | "image" | "video" | "document" | "status" | "template"
+    body_text: str | None = None,
+    message_id: str | None = None,   # WA message id (wamid...) if available
+    template_name: str | None = None,
+    status: str | None = None,       # "sent" | "delivered" | "read" | "failed"
+    error_text: str | None = None,
+    meta_json: str | None = None,    # store raw payload summary if you want
+):
+    """
+    Writes to whatsapp_messages table (you need this table in the same DB).
+    Uses kenya_now_db() to match your MySQL DATETIME schema.
+    """
+    q = text("""
+        INSERT INTO whatsapp_messages
+            (wa_number, direction, message_type, body_text, message_id, template_name,
+             status, error_text, meta_json, created_at)
+        VALUES
+            (:wa_number, :direction, :message_type, :body_text, :message_id, :template_name,
+             :status, :error_text, :meta_json, :created_at)
+    """)
+
+    engine = get_db_connection1()
+    with engine.begin() as conn:
+        conn.execute(
+            q,
+            {
+                "wa_number": str(wa_number),
+                "direction": direction,
+                "message_type": message_type,
+                "body_text": body_text,
+                "message_id": message_id,
+                "template_name": template_name,
+                "status": status,
+                "error_text": error_text,
+                "meta_json": meta_json,
+                "created_at": kenya_now_db(),
+            },
+        )
+
+
+def update_whatsapp_message_status(message_id: str, status: str, error_text: str | None = None):
+    """
+    Updates existing row by message_id (wamid) if you want status tracking.
+    """
+    q = text("""
+        UPDATE whatsapp_messages
+        SET status = :status,
+            error_text = :error_text
+        WHERE message_id = :message_id
+        LIMIT 1
+    """)
+    engine = get_db_connection1()
+    with engine.begin() as conn:
+        conn.execute(q, {"status": status, "error_text": error_text, "message_id": message_id})
