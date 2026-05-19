@@ -15,6 +15,7 @@ from conn1 import (
     log_whatsapp_message,
     update_whatsapp_message_status,
     is_registered_user_odoo,
+    check_user,
     register_user,
     accept_terms,
     mark_message_as_processed_odoo,
@@ -213,6 +214,36 @@ def _set_state(sender_id: str, **values):
             },
         )
         state.update(values)
+
+
+def sync_requester_state_from_odoo(whatsapp_number: str) -> dict:
+    """
+    Pull requester details from Odoo into the in-memory conversation state.
+
+    This is important on Heroku because dynos/workers can restart and lose memory.
+    The requester still exists in Odoo, so we rehydrate property/unit details when
+    a WhatsApp message arrives.
+    """
+    try:
+        data = check_user(str(whatsapp_number))
+    except Exception as exc:
+        logging.error(
+            "Failed to sync requester state from Odoo for %s: %s",
+            whatsapp_number,
+            exc,
+            exc_info=True,
+        )
+        return {"ok": False, "exists": False}
+
+    if data.get("exists") and data.get("requester"):
+        requester = data.get("requester") or {}
+        _set_state(
+            str(whatsapp_number),
+            property_id=requester.get("property_id"),
+            unit_number=requester.get("unit_number"),
+        )
+
+    return data
 
 
 def query_database(query, params=(), commit=False):
@@ -655,6 +686,9 @@ def should_process_message(sender_id, message_text):
 
 
 def is_registered_user(whatsapp_number):
+    data = sync_requester_state_from_odoo(str(whatsapp_number))
+    if data.get("exists") is not None:
+        return bool(data.get("exists"))
     return is_registered_user_odoo(str(whatsapp_number))
 
 
@@ -1089,18 +1123,31 @@ def process_media_upload(media_id, filename, sender_id, media_type, caption_text
             send_whatsapp_message(sender_id, "❌ Failed to save attachment. Please try again.")
             return
 
-        # After first attachment we definitely want the user in awaiting_issue_description state
-        query_database(
-            "UPDATE users SET last_action = 'awaiting_issue_description' WHERE whatsapp_number = %s",
-            (sender_id,),
-            commit=True,
-        )
+        # IMPORTANT:
+        # Do NOT automatically move to awaiting_issue_description if no category
+        # has been selected. Otherwise a later category reply like "4" becomes the
+        # ticket description and the ticket is created too early.
+        state = _get_state(sender_id)
+        temp_category = state.get("temp_category")
 
-        # Reset timer on each upload
-        start_or_reset_description_timer(sender_id)
+        if temp_category:
+            _set_state(sender_id, last_action="awaiting_issue_description")
 
-        # ✅ Buttons (instead of /done)
-        send_attachment_action_buttons(sender_id)
+            # Reset timer only once we are waiting for the description.
+            start_or_reset_description_timer(sender_id)
+
+            send_attachment_action_buttons(
+                sender_id,
+                note="✅ Attachment saved. You can add more files or describe the issue.",
+            )
+        else:
+            _set_state(sender_id, last_action="awaiting_category")
+
+            send_whatsapp_message(
+                sender_id,
+                "✅ Attachment saved. Please select a category before describing the issue.",
+            )
+            send_category_prompt(sender_id)
 
     finally:
         # ✅ Upload complete
@@ -1129,6 +1176,22 @@ def handle_ticket_creation(sender_id, message_text, property_id):
     category = user_info[0]["temp_category"]
 
     description = (message_text or "").strip()
+    normalized_description = description.lower()
+
+    # Defensive guard: never create a ticket before a category is selected.
+    # If the user sends 1/2/3/4 here, treat it as the category selection.
+    if not category:
+        if normalized_description in ["1", "2", "3", "4"]:
+            handle_category_selection(sender_id, normalized_description)
+            return
+
+        _set_state(sender_id, last_action="awaiting_category")
+        send_whatsapp_message(
+            sender_id,
+            "⚠️ Please select a category first. Reply with 1, 2, 3, or 4.",
+        )
+        send_category_prompt(sender_id)
+        return
 
     # If empty, try captions fallback
     if not description:
@@ -1235,6 +1298,16 @@ def handle_button_reply(message, sender_id):
         if is_uploading(sender_id):
             send_whatsapp_message(sender_id, "⏳ Please wait — your attachment is still uploading/processing.")
             send_attachment_action_buttons(sender_id)
+            return
+
+        state = _get_state(sender_id)
+        if not state.get("temp_category"):
+            _set_state(sender_id, last_action="awaiting_category")
+            send_whatsapp_message(
+                sender_id,
+                "⚠️ Please select a category before describing the issue.",
+            )
+            send_category_prompt(sender_id)
             return
 
         query_database(
@@ -1587,10 +1660,32 @@ def process_webhook(data):
                     continue
 
                 last_action = user_status[0]["last_action"]
+                temp_category = user_status[0].get("temp_category")
                 property_id = user_info[0]["property_id"]
+
+                # Defensive fallback: if the user replies 1/2/3/4 and no category
+                # is stored yet, treat it as category selection even if the state
+                # incorrectly says awaiting_issue_description.
+                if normalized in ["1", "2", "3", "4"] and (last_action == "awaiting_category" or not temp_category):
+                    handle_category_selection(sender_id, normalized)
+                    continue
 
                 if last_action == "awaiting_category":
                     handle_category_selection(sender_id, message_text)
+                    continue
+
+                if normalized in ["describe issue", "✍️ describe issue", "describe"]:
+                    if not temp_category:
+                        _set_state(sender_id, last_action="awaiting_category")
+                        send_whatsapp_message(
+                            sender_id,
+                            "⚠️ Please select a category before describing the issue.",
+                        )
+                        send_category_prompt(sender_id)
+                    else:
+                        _set_state(sender_id, last_action="awaiting_issue_description")
+                        send_whatsapp_message(sender_id, "✍️ Please describe your issue now.")
+                        start_or_reset_description_timer(sender_id)
                     continue
 
                 if last_action == "awaiting_issue_description":
