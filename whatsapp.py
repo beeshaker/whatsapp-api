@@ -2,31 +2,39 @@ import os
 import json
 import time
 import requests
-import mysql.connector
 import logging
+import mimetypes
+import re
 import threading
+import tempfile
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from conn1 import (
-    get_db_connection1,
     save_ticket_media,
     insert_ticket_and_get_id,
-    mark_user_accepted_via_temp_table,
-    log_whatsapp_message,              # ✅ ADD
+    log_whatsapp_message,
     update_whatsapp_message_status,
-    save_temp_media_to_db,   # ✅ IMPORTANT (so we don’t re-import inside)
+    is_registered_user_odoo,
+    register_user,
+    accept_terms,
+    mark_message_as_processed_odoo,
+    get_open_tickets,
 )
-from sqlalchemy.sql import text
 from threading import Timer
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import timezone, timedelta
 
 # -----------------------------------------------------------------------------
 # Timezone (Kenya)
 # -----------------------------------------------------------------------------
-KENYA_TZ = ZoneInfo("Africa/Nairobi")
+try:
+    KENYA_TZ = ZoneInfo("Africa/Nairobi")
+except ZoneInfoNotFoundError:
+    # Windows fallback if tzdata is not installed. Kenya is UTC+3 year-round.
+    KENYA_TZ = timezone(timedelta(hours=3))
 
 
 def kenya_now() -> datetime:
@@ -60,10 +68,67 @@ executor = ThreadPoolExecutor(max_workers=10)
 load_dotenv()
 WHATSAPP_ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-DB_HOST = os.getenv("DB_HOST")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+# MySQL is no longer used. Odoo API config is handled in conn1.py.
+
+# Local folder for temporary WhatsApp downloads before they are attached to Odoo.
+# On Windows, /tmp may not exist, so use tempfile.gettempdir() by default.
+UPLOAD_DIR = os.getenv("UPLOAD_DIR") or os.path.join(tempfile.gettempdir(), "apricot_whatsapp_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _safe_name(value: str | None, fallback: str = "whatsapp_media") -> str:
+    value = (value or fallback).strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._") or fallback
+
+
+def _extension_from_mime(mime_type: str | None, media_type: str | None = None) -> str:
+    mime_type = (mime_type or "").split(";")[0].strip().lower()
+
+    explicit = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "application/pdf": ".pdf",
+    }
+    if mime_type in explicit:
+        return explicit[mime_type]
+
+    guessed = mimetypes.guess_extension(mime_type) if mime_type else None
+    if guessed:
+        return ".jpg" if guessed == ".jpe" else guessed
+
+    media_type = (media_type or "").lower()
+    if media_type == "image":
+        return ".jpg"
+    if media_type == "video":
+        return ".mp4"
+    return ".bin"
+
+
+def _build_whatsapp_media_filename(media_type: str, media_id: str, media_obj: dict) -> tuple[str, str | None, str | None]:
+    """Return a proper filename, mimetype and optional direct media URL for Odoo attachments."""
+    media_obj = media_obj or {}
+    mime_type = media_obj.get("mime_type")
+    media_url = media_obj.get("url")
+
+    original = media_obj.get("filename")
+    ext = _extension_from_mime(mime_type, media_type)
+
+    if original:
+        base, original_ext = os.path.splitext(original)
+        base = _safe_name(base, fallback=f"{media_type}_{media_id}")
+        if not original_ext:
+            original_ext = ext
+        filename = f"{base}{original_ext}"
+    else:
+        filename = f"{_safe_name(media_type)}_{_safe_name(media_id)}{ext}"
+
+    return filename, mime_type, media_url
 
 # -----------------------------------------------------------------------------
 # Locks
@@ -98,6 +163,14 @@ DESCRIPTION_TTL_SECONDS = 5 * 60  # ✅ delete uploads if no description in 5 mi
 # Per-user description timers (in-memory)
 description_timers = {}  # { sender_id: Timer }
 
+# Odoo migration state:
+# Temporary attachments and WhatsApp flow state are kept in memory until ticket creation.
+# The final requester, ticket, attachments, and message logs are persisted in Odoo.
+temp_media_store = {}      # { sender_id: [ {id, media_type, media_path, caption, uploaded_at} ] }
+temp_media_next_id = 1
+user_flow_state = {}       # { sender_id: {last_action, temp_category, property_id, unit_number} }
+state_lock = threading.Lock()
+
 # -----------------------------------------------------------------------------
 # Button / List IDs
 # -----------------------------------------------------------------------------
@@ -113,27 +186,189 @@ LIST_ATTACH_REMOVE_LAST = "attach_remove_last"
 LIST_ATTACH_CLEAR_ALL = "attach_clear_all"
 
 # -----------------------------------------------------------------------------
-# DB helper
+# Legacy DB helper compatibility layer
 # -----------------------------------------------------------------------------
-def query_database(query, params=(), commit=False):
-    try:
-        conn = mysql.connector.connect(
-            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
+def _get_state(sender_id: str) -> dict:
+    with state_lock:
+        return user_flow_state.setdefault(
+            sender_id,
+            {
+                "last_action": None,
+                "temp_category": None,
+                "property_id": None,
+                "unit_number": None,
+            },
         )
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(query, params)
-        if commit:
-            conn.commit()
-            cursor.close()
-            conn.close()
+
+
+def _set_state(sender_id: str, **values):
+    with state_lock:
+        state = user_flow_state.setdefault(
+            sender_id,
+            {
+                "last_action": None,
+                "temp_category": None,
+                "property_id": None,
+                "unit_number": None,
+            },
+        )
+        state.update(values)
+
+
+def query_database(query, params=(), commit=False):
+    """
+    Compatibility shim while moving from AWS MySQL to Odoo.
+
+    The original webhook code called query_database() for session state, temporary
+    attachments and processed-message checks. Those are now handled in memory here.
+    Final data is persisted in Odoo through conn1.py API helpers.
+    """
+    global temp_media_next_id
+
+    q = " ".join((query or "").lower().split())
+    params = params or ()
+
+    try:
+        # ------------------------------------------------------------------
+        # Temp attachment store
+        # ------------------------------------------------------------------
+        if "from temp_ticket_media" in q:
+            sender_id = str(params[0]) if params else ""
+            rows = list(temp_media_store.get(sender_id, []))
+
+            if "count(*)" in q:
+                return [{"c": len(rows)}]
+
+            if "select caption" in q:
+                return [{"caption": r.get("caption")} for r in rows]
+
+            if "order by uploaded_at desc" in q and "limit 1" in q:
+                return [rows[-1]] if rows else []
+
+            if "select media_type, media_path" in q:
+                return [
+                    {
+                        "media_type": r.get("media_type"),
+                        "media_path": r.get("media_path"),
+                        "mimetype": r.get("mimetype"),
+                        "filename": r.get("filename"),
+                    }
+                    for r in rows
+                ]
+
+            return rows
+
+        if q.startswith("delete from temp_ticket_media where sender_id"):
+            sender_id = str(params[0]) if params else ""
+            temp_media_store.pop(sender_id, None)
             return True
-        result = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return result
-    except mysql.connector.Error as err:
-        logging.error(f"Database error: {err}")
+
+        if q.startswith("delete from temp_ticket_media where id"):
+            media_id = int(params[0])
+            for sender_id, rows in list(temp_media_store.items()):
+                temp_media_store[sender_id] = [r for r in rows if int(r.get("id")) != media_id]
+            return True
+
+        # ------------------------------------------------------------------
+        # Processed messages
+        # ------------------------------------------------------------------
+        if "from processed_messages" in q:
+            message_id = str(params[0]) if params else ""
+            return [{"id": message_id}] if message_id in processed_message_ids else []
+
+        if q.startswith("insert ignore into processed_messages"):
+            message_id = str(params[0]) if params else ""
+            processed_message_ids.add(message_id)
+            try:
+                mark_message_as_processed_odoo(message_id)
+            except Exception:
+                logging.error("Failed to mark processed message in Odoo", exc_info=True)
+            return True
+
+        # ------------------------------------------------------------------
+        # User/requester state
+        # ------------------------------------------------------------------
+        if "from users" in q and "where whatsapp_number" in q:
+            sender_id = str(params[0]) if params else ""
+            state = _get_state(sender_id)
+
+            if "select id, temp_category" in q:
+                return [{"id": sender_id, "temp_category": state.get("temp_category")} ]
+
+            if "select last_action, temp_category" in q:
+                return [{
+                    "last_action": state.get("last_action"),
+                    "temp_category": state.get("temp_category"),
+                }]
+
+            if "select last_action" in q:
+                return [{"last_action": state.get("last_action")}]
+
+            if "select property_id" in q:
+                return [{"property_id": state.get("property_id")}]
+
+            if "select id" in q:
+                return [{"id": sender_id}] if is_registered_user_odoo(sender_id) else []
+
+        if q.startswith("update users set") and "where whatsapp_number" in q:
+            sender_id = str(params[-1]) if params else ""
+
+            if "last_action = null" in q:
+                _set_state(sender_id, last_action=None, temp_category=None)
+                return True
+
+            if "last_action = 'awaiting_category'" in q:
+                _set_state(sender_id, last_action="awaiting_category")
+                return True
+
+            if "last_action = 'awaiting_issue_description', temp_category =" in q:
+                category = params[0] if params else None
+                _set_state(sender_id, last_action="awaiting_issue_description", temp_category=category)
+                return True
+
+            if "last_action = 'awaiting_issue_description'" in q:
+                _set_state(sender_id, last_action="awaiting_issue_description")
+                return True
+
+        # ------------------------------------------------------------------
+        # Active tickets / check status
+        # ------------------------------------------------------------------
+        if "from tickets" in q:
+            sender_id = str(params[0]) if params else ""
+            tickets = get_open_tickets(sender_id)
+            return tickets or []
+
+        logging.warning("query_database shim did not handle query: %s params=%s", q, params)
+        return True if commit else []
+
+    except Exception as err:
+        logging.error("query_database compatibility error: %s", err, exc_info=True)
         return None
+
+
+def save_temp_media_to_db(sender_id, media_type, media_path, caption, mimetype=None, filename=None):
+    """Store pending media in memory until a ticket is created in Odoo."""
+    global temp_media_next_id
+    row = {
+        "id": temp_media_next_id,
+        "media_type": media_type,
+        "media_path": media_path,
+        "caption": caption,
+        "mimetype": mimetype,
+        "filename": filename or os.path.basename(media_path),
+        "uploaded_at": kenya_now(),
+    }
+    temp_media_next_id += 1
+    temp_media_store.setdefault(str(sender_id), []).append(row)
+    logging.info(
+        "✅ Temp media stored in memory for %s: %s -> %s filename=%s mimetype=%s",
+        sender_id,
+        media_type,
+        media_path,
+        row["filename"],
+        mimetype,
+    )
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -375,6 +610,13 @@ def opt_in_user_route():
         "property_id": property_id,
         "unit_number": unit_number,
     }
+    _set_state(
+        whatsapp_number,
+        property_id=property_id,
+        unit_number=unit_number,
+        last_action=None,
+        temp_category=None,
+    )
     terms_pending_users[whatsapp_number] = time.time()
 
     send_terms_prompt(whatsapp_number)
@@ -413,17 +655,7 @@ def should_process_message(sender_id, message_text):
 
 
 def is_registered_user(whatsapp_number):
-    engine = get_db_connection1()
-    with engine.connect() as conn:
-        user_check = conn.execute(
-            text("SELECT id FROM users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number},
-        ).fetchone()
-        admin_check = conn.execute(
-            text("SELECT id FROM admin_users WHERE whatsapp_number = :whatsapp_number"),
-            {"whatsapp_number": whatsapp_number},
-        ).fetchone()
-    return user_check is not None or admin_check is not None
+    return is_registered_user_odoo(str(whatsapp_number))
 
 
 # -----------------------------------------------------------------------------
@@ -491,34 +723,27 @@ def send_whatsapp_message(to, message):
 
 
 def send_whatsapp_tickets(to):
-    message = ""
-    query = """
-        SELECT 
-            id,
-            LEFT(issue_description, 50) AS short_description,
-            status,
-            COALESCE(updated_at, created_at) AS last_update
-        FROM tickets
-        WHERE user_id = (SELECT id FROM users WHERE whatsapp_number = %s)
-          AND LOWER(status) IN ('open', 'in progress')
-        ORDER BY COALESCE(updated_at, created_at) DESC
-        LIMIT 20
-    """
-    tickets = query_database(query, (to,))
+    tickets = get_open_tickets(str(to)) or []
 
     if not tickets:
-        message = "You have no open or in-progress tickets at the moment."
-    else:
-        message = "Your active tickets (Open / In Progress):\n\n"
-        for ticket in tickets:
-            message += (
-                f"Ticket ID: {ticket['id']}\n"
-                f"Status: {ticket['status']}\n"
-                f"Description: {ticket['short_description']}\n"
-                f"Last Update on: {ticket['last_update']}\n\n"
-            )
+        send_whatsapp_message(to, "You have no open or in-progress tickets at the moment.")
+        return
+
+    message = "Your active tickets (Open / In Progress):\n\n"
+    for ticket in tickets[:20]:
+        ticket_id = ticket.get("id") or ticket.get("ticket_id") or ticket.get("name")
+        status = ticket.get("status") or ticket.get("stage") or "Open"
+        desc = ticket.get("short_description") or ticket.get("description") or ""
+        last_update = ticket.get("last_update") or ticket.get("updated_at") or ""
+        message += (
+            f"Ticket ID: {ticket_id}\n"
+            f"Status: {status}\n"
+            f"Description: {desc}\n"
+            f"Last Update on: {last_update}\n\n"
+        )
 
     send_whatsapp_message(to, message)
+
 
 
 def send_attachment_action_buttons(sender_id: str, note: str | None = None):
@@ -612,7 +837,7 @@ def webhook():
 
     data = request.get_json()
     logging.info(f"Incoming webhook data: {json.dumps(data, indent=2)}")
-    executor.submit(process_webhook, data)
+    executor.submit(_safe_process_webhook, data)
     return jsonify({"status": "received"}), 200
 
 
@@ -711,34 +936,70 @@ def send_template_message(to, template_name, parameters):
 # -----------------------------------------------------------------------------
 # Media handling
 # -----------------------------------------------------------------------------
-def download_media(media_id, filename=None):
-    meta_url = f"https://graph.facebook.com/v22.0/{media_id}"
-    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+def download_media(media_id, filename=None, media_url=None, mimetype=None, media_type=None):
+    """
+    Download WhatsApp media to a local temp folder.
 
-    media_response = requests.get(meta_url, headers=headers)
-    if media_response.status_code != 200:
-        return {"error": "Failed to fetch media URL", "details": media_response.text}
+    Fixes Windows issue where /tmp may not exist. Also catches/logs failures so
+    background webhook threads do not fail silently.
+    """
+    try:
+        headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
 
-    media_url = media_response.json().get("url")
-    if not media_url:
-        return {"error": "Media URL not found"}
+        # Some webhook payloads include a direct media URL. Use it if present;
+        # otherwise fetch the media metadata URL from Graph.
+        if not media_url:
+            meta_url = f"https://graph.facebook.com/v22.0/{media_id}"
+            media_response = requests.get(meta_url, headers=headers, timeout=30)
+            if media_response.status_code != 200:
+                logging.error(
+                    "❌ Failed to fetch media URL media_id=%s status=%s body=%s",
+                    media_id,
+                    media_response.status_code,
+                    media_response.text,
+                )
+                return {"error": "Failed to fetch media URL", "details": media_response.text}
 
-    media_file_response = requests.get(media_url, headers=headers)
-    if media_file_response.status_code != 200:
-        return {"error": "Failed to download media", "details": media_file_response.text}
+            media_url = media_response.json().get("url")
+            if not media_url:
+                logging.error("❌ Media URL missing in metadata response for media_id=%s", media_id)
+                return {"error": "Media URL not found"}
 
-    timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
-    if not filename:
-        filename = f"{media_id}_{timestamp}.bin"
-    else:
-        name, ext = os.path.splitext(filename)
-        filename = f"{name}_{timestamp}{ext}"
+        media_file_response = requests.get(media_url, headers=headers, timeout=60)
+        if media_file_response.status_code != 200:
+            logging.error(
+                "❌ Failed to download media media_id=%s status=%s body=%s",
+                media_id,
+                media_file_response.status_code,
+                media_file_response.text,
+            )
+            return {"error": "Failed to download media", "details": media_file_response.text}
 
-    save_path = os.path.join("/tmp", filename)
-    with open(save_path, "wb") as f:
-        f.write(media_file_response.content)
+        timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
+        if not filename:
+            filename = f"{media_id}_{timestamp}{_extension_from_mime(mimetype, media_type)}"
+        else:
+            name, ext = os.path.splitext(filename)
+            if not ext or ext.lower() in (".ima", ".vid", ".doc"):
+                ext = _extension_from_mime(mimetype, media_type)
+            filename = f"{name}_{timestamp}{ext}"
 
-    return {"success": True, "path": save_path}
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        with open(save_path, "wb") as f:
+            f.write(media_file_response.content)
+
+        logging.info(
+            "✅ Downloaded WhatsApp media media_id=%s bytes=%s path=%s",
+            media_id,
+            len(media_file_response.content),
+            save_path,
+        )
+        return {"success": True, "path": save_path}
+
+    except Exception as e:
+        logging.error("❌ Exception while downloading media_id=%s: %s", media_id, e, exc_info=True)
+        return {"error": str(e)}
 
 
 def purge_expired_items():
@@ -784,11 +1045,13 @@ def is_valid_message(sender_id, message_id, message_text):
     return True
 
 
-def process_media_upload(media_id, filename, sender_id, media_type, caption_text):
+def process_media_upload(media_id, filename, sender_id, media_type, caption_text, mimetype=None, media_url=None):
     # ✅ Mark this sender as “uploading” to block Describe/Ticket creation until complete
     set_uploading(sender_id, True)
 
     try:
+        logging.info("📎 Processing media upload sender=%s media_id=%s type=%s filename=%s", sender_id, media_id, media_type, filename)
+
         # Attachment limit
         current_count = get_temp_media_count(sender_id)
         if current_count >= MAX_ATTACHMENTS:
@@ -812,7 +1075,7 @@ def process_media_upload(media_id, filename, sender_id, media_type, caption_text
             send_category_prompt(sender_id)
             return
 
-        download_result = download_media(media_id, filename)
+        download_result = download_media(media_id, filename, media_url=media_url, mimetype=mimetype, media_type=media_type)
         if "success" not in download_result:
             logging.error(f"❌ Download failed for {sender_id}: {download_result}")
             send_whatsapp_message(sender_id, f"❌ Failed to upload {media_type}. Please try again.")
@@ -820,7 +1083,8 @@ def process_media_upload(media_id, filename, sender_id, media_type, caption_text
 
         caption = (caption_text or "").strip() or "No Caption"
 
-        ok = save_temp_media_to_db(sender_id, media_type, download_result["path"], caption)
+        logging.info("📎 Saving temp media sender=%s type=%s path=%s", sender_id, media_type, download_result["path"])
+        ok = save_temp_media_to_db(sender_id, media_type, download_result["path"], caption, mimetype=mimetype, filename=os.path.basename(download_result["path"]))
         if not ok:
             send_whatsapp_message(sender_id, "❌ Failed to save attachment. Please try again.")
             return
@@ -899,9 +1163,11 @@ def handle_ticket_creation(sender_id, message_text, property_id):
         (sender_id,),
     ) or []
 
+    logging.info("📎 Found %s pending attachment(s) for sender=%s before upload to Odoo ticket=%s", len(recent_media), sender_id, ticket_id)
+
     attached = 0
     for entry in recent_media:
-        if save_ticket_media(ticket_id, entry["media_type"], entry["media_path"]):
+        if save_ticket_media(ticket_id, entry["media_type"], entry["media_path"], mimetype=entry.get("mimetype"), filename=entry.get("filename")):
             attached += 1
 
     # Cleanup temp media + local files
@@ -1033,26 +1299,37 @@ def handle_media_upload(message, sender_id, message_text):
     if media_type not in ["document", "image", "video"]:
         return False
 
+    logging.info("📎 Incoming media detected sender=%s type=%s message_id=%s", sender_id, media_type, message.get("id"))
+
     # If an upload is already in flight, tell them to wait (prevents piling up)
     if is_uploading(sender_id):
         send_whatsapp_message(sender_id, "⏳ Please wait — your previous attachment is still processing.")
         send_attachment_action_buttons(sender_id)
         return True  # we handled it
 
-    media_id = message[media_type]["id"]
-    base_filename = message[media_type].get("filename", f"{media_id}.{media_type[:3]}")
-    name, ext = os.path.splitext(base_filename)
-    timestamp = kenya_now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{name}_{timestamp}{ext}"
+    media_obj = message.get(media_type, {}) or {}
+    media_id = media_obj["id"]
+    filename, mimetype, direct_media_url = _build_whatsapp_media_filename(media_type, media_id, media_obj)
 
     # ✅ Pass caption through so it’s saved properly
-    caption = ""
-    if media_type in message and isinstance(message[media_type], dict):
-        caption = (message[media_type].get("caption") or "").strip()
+    caption = (media_obj.get("caption") or "").strip() if isinstance(media_obj, dict) else ""
+
+    logging.info(
+        "📎 Media filename resolved sender=%s type=%s media_id=%s filename=%s mimetype=%s",
+        sender_id,
+        media_type,
+        media_id,
+        filename,
+        mimetype,
+    )
 
     # process upload async but wait (keeps current behaviour deterministic)
-    future = executor.submit(process_media_upload, media_id, filename, sender_id, media_type, caption)
-    future.result()
+    future = executor.submit(process_media_upload, media_id, filename, sender_id, media_type, caption, mimetype, direct_media_url)
+    try:
+        future.result()
+    except Exception as e:
+        logging.error("❌ Media upload worker crashed sender=%s media_id=%s: %s", sender_id, media_id, e, exc_info=True)
+        send_whatsapp_message(sender_id, "❌ Failed to process the attachment. Please try uploading it again.")
     return True
 
 
@@ -1094,27 +1371,7 @@ def handle_category_selection(sender_id: str, message_text: str):
 # ✅ TIME FIX HERE: remove NOW() and store Kenya time
 # -----------------------------------------------------------------------------
 def mark_user_accepted(whatsapp_number):
-    engine = get_db_connection1()
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT id FROM users WHERE whatsapp_number = :num"),
-            {"num": whatsapp_number},
-        ).fetchone()
-        if not result:
-            raise Exception("User not found in DB")
-
-        conn.execute(
-            text(
-                """
-                UPDATE users
-                SET terms_accepted = 1,
-                    terms_accepted_at = :ts
-                WHERE whatsapp_number = :num
-                """
-            ),
-            {"num": whatsapp_number, "ts": kenya_now()},
-        )
-        conn.commit()
+    return accept_terms(str(whatsapp_number))
 
 
 def handle_accept(sender_id):
@@ -1122,52 +1379,54 @@ def handle_accept(sender_id):
         logging.info(f"Processing accept for {sender_id}")
         send_whatsapp_message(sender_id, "⏳ We're getting things sorted, this may take a minute or two...")
 
-        if sender_id in accept_retry_state:
-            retry_info = accept_retry_state.pop(sender_id)
-            if retry_info and retry_info["timer"]:
-                retry_info["timer"].cancel()
-
         if is_registered_user(sender_id):
             with terms_pending_lock:
                 terms_pending_users.pop(sender_id, None)
+            try:
+                accept_terms(sender_id)
+            except Exception:
+                logging.error("Failed to mark existing requester terms accepted in Odoo", exc_info=True)
             send_whatsapp_message(sender_id, "🎉 You are already registered!")
             return
 
-        def try_register(attempt):
-            with accept_lock:
-                if is_registered_user(sender_id):
-                    accept_retry_state.pop(sender_id, None)
-                    with terms_pending_lock:
-                        terms_pending_users.pop(sender_id, None)
-                    send_whatsapp_message(sender_id, "🎉 You are already registered!")
-                    return
+        payload = temp_opt_in_data.get(sender_id) or {}
+        if not payload:
+            with terms_pending_lock:
+                terms_pending_users.pop(sender_id, None)
+            send_whatsapp_message(
+                sender_id,
+                "⚠️ We couldn't find your registration details. Please contact support to resend the opt-in.",
+            )
+            return
 
-                try:
-                    mark_user_accepted_via_temp_table(sender_id)
-
-                    accept_retry_state.pop(sender_id, None)
-                    with terms_pending_lock:
-                        terms_pending_users.pop(sender_id, None)
-
-                    send_whatsapp_message(sender_id, "🎉 You've been registered successfully!")
-                except Exception as e:
-                    logging.error(f"❌ Attempt {attempt} failed for {sender_id}: {e}")
-                    if attempt < 3:
-                        timer = Timer(15, try_register, args=[attempt + 1])
-                        accept_retry_state[sender_id] = {"attempt": attempt + 1, "timer": timer}
-                        timer.start()
-                    else:
-                        accept_retry_state.pop(sender_id, None)
-                        with terms_pending_lock:
-                            terms_pending_users.pop(sender_id, None)
-                        send_whatsapp_message(
-                            sender_id,
-                            "⚠️ We couldn't finalize your registration. Please try again or contact support.",
-                        )
-
-        timer = Timer(1, try_register, args=[1])
-        accept_retry_state[sender_id] = {"attempt": 1, "timer": timer}
-        timer.start()
+        try:
+            register_user(
+                whatsapp_number=sender_id,
+                name=payload.get("name") or sender_id,
+                property_id=payload.get("property_id"),
+                unit_number=payload.get("unit_number"),
+                terms_accepted=True,
+            )
+            accept_terms(sender_id)
+            _set_state(
+                sender_id,
+                property_id=payload.get("property_id"),
+                unit_number=payload.get("unit_number"),
+                last_action=None,
+                temp_category=None,
+            )
+            temp_opt_in_data.pop(sender_id, None)
+            with terms_pending_lock:
+                terms_pending_users.pop(sender_id, None)
+            send_whatsapp_message(sender_id, "🎉 You've been registered successfully!")
+        except Exception as e:
+            logging.error(f"❌ Odoo registration failed for {sender_id}: {e}", exc_info=True)
+            with terms_pending_lock:
+                terms_pending_users.pop(sender_id, None)
+            send_whatsapp_message(
+                sender_id,
+                "⚠️ We couldn't finalize your registration. Please try again or contact support.",
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -1204,6 +1463,13 @@ def handle_cancel_command(sender_id):
 # -----------------------------------------------------------------------------
 # Webhook processor
 # -----------------------------------------------------------------------------
+def _safe_process_webhook(data):
+    try:
+        process_webhook(data)
+    except Exception as e:
+        logging.error("❌ Unhandled exception in process_webhook: %s", e, exc_info=True)
+
+
 def process_webhook(data):
     logging.info(f"Processing webhook data:\n{json.dumps(data, indent=2)}")
 

@@ -1,336 +1,339 @@
-# conn1.py (FULL UPDATED — MATCHES YOUR DB SCHEMA)
-# ✅ Uses NAIVE Kenya time for MySQL DATETIME inserts (prevents tz-aware errors)
-# ✅ Uses engine.begin() for automatic commit/rollback
-# ✅ Reuses a single SQLAlchemy engine (thread-safe init + pool_pre_ping)
-# ✅ save_ticket_media() inserts into ticket_media.uploaded_at (per your screenshot)
-# ✅ save_temp_media_to_db() inserts into temp_ticket_media.uploaded_at (common pattern)
-# ✅ Keeps function names/signatures the same so webhook code doesn’t break
+# conn1.py — ODOO API ADAPTER
+# Replaces the old AWS/MySQL writes with calls to the Apricot Ticketing Odoo module.
+# Keep this filename as conn1.py in Flask so whatsapp.py imports do not break.
 
 from __future__ import annotations
 
-import os
-import threading
+import base64
+import json
 import logging
+import mimetypes
+import os
+import time
 from datetime import datetime
+from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
-from sqlalchemy.sql import text
 
 load_dotenv()
 
-# -----------------------------------------------------------------------------
-# Timezone: Kenya (Africa/Nairobi)
-# -----------------------------------------------------------------------------
 KENYA_TZ = ZoneInfo("Africa/Nairobi")
 
 
 def kenya_now() -> datetime:
-    """Timezone-aware Kenya time (good for logs/UI)."""
     return datetime.now(KENYA_TZ)
 
 
 def kenya_now_db() -> datetime:
-    """
-    Naive Kenya time for DB inserts.
-    MySQL DATETIME often rejects tz-aware datetimes.
-    """
     return datetime.now(KENYA_TZ).replace(tzinfo=None)
 
 
 # -----------------------------------------------------------------------------
-# Database Connection using SQLAlchemy
+# Odoo API config
 # -----------------------------------------------------------------------------
-DB_URI = (
-    f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
-    f"@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
-)
-
-_ENGINE = None
-_ENGINE_LOCK = threading.Lock()
+ODOO_BASE_URL = (os.getenv("ODOO_BASE_URL") or "http://localhost:8069").rstrip("/")
+ODOO_DB = os.getenv("ODOO_DB") or "crm"
+ODOO_API_TOKEN = os.getenv("ODOO_API_TOKEN") or os.getenv("ODOO_TICKETING_API_TOKEN")
+ODOO_TIMEOUT = int(os.getenv("ODOO_TIMEOUT", "30"))
 
 
-def get_db_connection1():
-    """
-    Returns a singleton SQLAlchemy engine.
-    Re-uses pool across threads/process lifetime.
-    """
-    global _ENGINE
-    if _ENGINE is None:
-        with _ENGINE_LOCK:
-            if _ENGINE is None:
-                _ENGINE = create_engine(
-                    DB_URI,
-                    pool_pre_ping=True,
-                    pool_recycle=1800,
-                )
-    return _ENGINE
+class OdooAPIError(RuntimeError):
+    pass
 
 
-# -----------------------------------------------------------------------------
-# Media: Save final ticket media (blob)
-# -----------------------------------------------------------------------------
-def save_ticket_media(ticket_id, media_type, file_path):
-    """
-    Saves media content (as blob) linked to a ticket in the database.
-    Matches your ticket_media table:
-      (ticket_id, media_type, media_path, media_blob, uploaded_at)
+def _headers() -> dict[str, str]:
+    if not ODOO_API_TOKEN:
+        raise OdooAPIError("ODOO_API_TOKEN is missing from environment variables")
+    # X-API-Key is what worked reliably in your Odoo local tests.
+    return {
+        "X-API-Key": ODOO_API_TOKEN,
+        "Content-Type": "application/json",
+    }
 
-    Returns True/False so caller can log failures cleanly.
-    """
-    try:
-        with open(file_path, "rb") as f:
-            binary_content = f.read()
-    except Exception as e:
-        logging.error(f"❌ Failed to read media file {file_path}: {e}", exc_info=True)
-        return False
 
-    query = text("""
-        INSERT INTO ticket_media (ticket_id, media_type, media_path, media_blob, uploaded_at)
-        VALUES (:ticket_id, :media_type, :media_path, :media_blob, :uploaded_at)
-    """)
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    sep = "&" if "?" in path else "?"
+    if ODOO_DB:
+        return f"{ODOO_BASE_URL}{path}{sep}{urlencode({'db': ODOO_DB})}"
+    return f"{ODOO_BASE_URL}{path}"
 
-    try:
-        engine = get_db_connection1()
-        with engine.begin() as conn:
-            conn.execute(
-                query,
-                {
-                    "ticket_id": ticket_id,
-                    "media_type": media_type,
-                    "media_path": file_path,
-                    "media_blob": binary_content,
-                    "uploaded_at": kenya_now_db(),
-                },
+
+def odoo_post(path: str, payload: dict[str, Any] | None = None, *, retries: int = 2) -> dict[str, Any]:
+    payload = payload or {}
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                _url(path),
+                headers=_headers(),
+                json=payload,
+                timeout=ODOO_TIMEOUT,
             )
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
 
-        logging.info(f"✅ Media saved for ticket #{ticket_id}: {media_type} -> {file_path}")
-        return True
+            if response.status_code >= 400:
+                raise OdooAPIError(
+                    f"Odoo API HTTP {response.status_code} at {path}: {data}"
+                )
+            if isinstance(data, dict) and data.get("ok") is False:
+                raise OdooAPIError(f"Odoo API rejected {path}: {data}")
+            return data
 
-    except Exception as e:
-        logging.error(
-            f"❌ Failed to insert media into DB for ticket {ticket_id}: {e}",
-            exc_info=True,
-        )
+        except Exception as exc:
+            last_error = exc
+            logging.error("Odoo API call failed attempt %s path=%s error=%s", attempt + 1, path, exc)
+            if attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
+
+    raise OdooAPIError(str(last_error))
+
+
+def odoo_health() -> dict[str, Any]:
+    response = requests.get(_url("/apricot_ticketing/api/health"), timeout=ODOO_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+# -----------------------------------------------------------------------------
+# Compatibility shim: old code expected a DB engine. Do not use in new code.
+# -----------------------------------------------------------------------------
+def get_db_connection1():
+    raise RuntimeError(
+        "MySQL has been disabled. Use the Odoo API helper functions in conn1.py instead."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Odoo requester/user helpers
+# -----------------------------------------------------------------------------
+def check_user(whatsapp_number: str) -> dict[str, Any]:
+    return odoo_post("/api/apricot_ticketing/check_user", {"whatsapp_number": whatsapp_number})
+
+
+def is_registered_user_odoo(whatsapp_number: str) -> bool:
+    try:
+        data = check_user(whatsapp_number)
+        return bool(data.get("exists"))
+    except Exception:
+        logging.error("Failed to check Odoo user %s", whatsapp_number, exc_info=True)
         return False
 
 
+def register_user(
+    whatsapp_number: str,
+    name: str | None = None,
+    property_id: int | str | None = None,
+    property_name: str | None = None,
+    unit_number: str | None = None,
+    terms_accepted: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "whatsapp_number": whatsapp_number,
+        "name": name or whatsapp_number,
+        "unit_number": unit_number,
+        "terms_accepted": terms_accepted,
+    }
+    if property_id not in (None, ""):
+        payload["property_id"] = property_id
+    if property_name:
+        payload["property_name"] = property_name
+    return odoo_post("/api/apricot_ticketing/register_user", payload)
+
+
+def accept_terms(whatsapp_number: str) -> dict[str, Any]:
+    return odoo_post("/api/apricot_ticketing/accept_terms", {"whatsapp_number": whatsapp_number})
+
+
+def mark_user_accepted_via_temp_table(whatsapp_number: str):
+    """
+    Old MySQL function name kept for compatibility.
+    The actual registration payload is handled in whatsapp.py using temp_opt_in_data.
+    This fallback only marks terms accepted if the requester already exists in Odoo.
+    """
+    return accept_terms(whatsapp_number)
+
+
 # -----------------------------------------------------------------------------
-# Tickets: Insert and assign to property supervisor
+# Tickets and media
 # -----------------------------------------------------------------------------
+def create_ticket(
+    whatsapp_number: str,
+    description: str,
+    category: str | None = None,
+    property_id: int | str | None = None,
+    property_name: str | None = None,
+    unit_number: str | None = None,
+    source: str = "whatsapp",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "whatsapp_number": whatsapp_number,
+        "issue_description": description,
+        "category_name": category or "Other",
+        "unit_number": unit_number,
+        "source": source,
+    }
+    if property_id not in (None, ""):
+        payload["property_id"] = property_id
+    if property_name:
+        payload["property_name"] = property_name
+    return odoo_post("/api/apricot_ticketing/create_ticket", payload)
+
+
 def insert_ticket_and_get_id(user_id, description, category, property_id):
     """
-    Inserts a new ticket and returns the auto-incremented ticket ID.
-    Assigns the ticket to the property's supervisor_id (property manager).
-    Falls back to admin_id=6 if supervisor_id is NULL.
-    Uses naive Kenya time (MySQL-friendly).
+    Old signature kept.
+    In the converted Flask flow, user_id should be the WhatsApp number.
+    Returns Odoo ticket_id.
     """
-    engine = get_db_connection1()
+    whatsapp_number = str(user_id)
+    data = create_ticket(
+        whatsapp_number=whatsapp_number,
+        description=description,
+        category=category,
+        property_id=property_id,
+    )
+    return data.get("ticket_id")
 
-    get_supervisor = text("""
-        SELECT supervisor_id
-        FROM properties
-        WHERE id = :property_id
-        LIMIT 1
-    """)
 
-    insert_query = text("""
-        INSERT INTO tickets
-        (user_id, issue_description, status, created_at, category, property_id, assigned_admin)
-        VALUES (:user_id, :description, 'Open', :created_at, :category, :property_id, :assigned_admin)
-    """)
+def _guess_mimetype(file_path: str, media_type: str | None = None) -> str | None:
+    mimetype, _ = mimetypes.guess_type(file_path)
+    if mimetype:
+        return mimetype
 
-    select_query = text("SELECT LAST_INSERT_ID() AS id")
+    media_type = (media_type or "").lower()
+    if media_type == "image":
+        return "image/jpeg"
+    if media_type == "video":
+        return "video/mp4"
+    if media_type == "document":
+        return "application/octet-stream"
+    return None
 
+
+def save_ticket_media(ticket_id, media_type, file_path, mimetype: str | None = None, filename: str | None = None):
     try:
-        with engine.begin() as conn:
-            row = conn.execute(get_supervisor, {"property_id": property_id}).fetchone()
-            supervisor_id = row[0] if row else None
-            assigned_admin = supervisor_id if supervisor_id else 6
+        with open(file_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
 
-            conn.execute(
-                insert_query,
-                {
-                    "user_id": user_id,
-                    "description": description,
-                    "category": category,
-                    "property_id": property_id,
-                    "assigned_admin": assigned_admin,
-                    "created_at": kenya_now_db(),
-                },
-            )
+        clean_filename = filename or os.path.basename(file_path)
+        clean_mimetype = mimetype or _guess_mimetype(file_path, media_type)
 
-            result = conn.execute(select_query).fetchone()
-            return int(result[0]) if result else None
-
-    except Exception as e:
-        logging.error(
-            f"❌ Failed to insert ticket for user_id={user_id}, property_id={property_id}: {e}",
-            exc_info=True,
+        payload = {
+            "ticket_id": int(ticket_id),
+            "filename": clean_filename,
+            "mimetype": clean_mimetype,
+            "media_type": media_type,
+            "base64": encoded,
+        }
+        odoo_post("/api/apricot_ticketing/upload_ticket_media", payload)
+        logging.info(
+            "✅ Uploaded media to Odoo ticket=%s file=%s filename=%s mimetype=%s",
+            ticket_id,
+            file_path,
+            clean_filename,
+            clean_mimetype,
         )
-        raise
-
-
-# -----------------------------------------------------------------------------
-# Users: Accept terms via temp table -> main users table
-# -----------------------------------------------------------------------------
-def mark_user_accepted_via_temp_table(whatsapp_number):
-    """
-    Moves a user from temp_opt_in_users to users table, and marks terms as accepted.
-    If the user already exists, updates their terms_accepted status and timestamp.
-    Uses naive Kenya time (MySQL-friendly).
-    """
-    engine = get_db_connection1()
-
-    try:
-        with engine.begin() as conn:
-            user = conn.execute(
-                text("""
-                    SELECT name, property_id, unit_number
-                    FROM temp_opt_in_users
-                    WHERE whatsapp_number = :num
-                """),
-                {"num": whatsapp_number},
-            ).fetchone()
-
-            if not user:
-                raise Exception(f"User {whatsapp_number} not found in temp_opt_in_users")
-
-            name, property_id, unit_number = user[0], user[1], user[2]
-            now_ke = kenya_now_db()
-
-            conn.execute(
-                text("""
-                    INSERT INTO users
-                        (name, whatsapp_number, property_id, unit_number, terms_accepted, terms_accepted_at)
-                    VALUES
-                        (:name, :whatsapp_number, :property_id, :unit_number, 1, :terms_accepted_at)
-                    ON DUPLICATE KEY UPDATE
-                        terms_accepted = 1,
-                        terms_accepted_at = :terms_accepted_at
-                """),
-                {
-                    "name": name,
-                    "whatsapp_number": whatsapp_number,
-                    "property_id": property_id,
-                    "unit_number": unit_number,
-                    "terms_accepted_at": now_ke,
-                },
-            )
-
-            conn.execute(
-                text("DELETE FROM temp_opt_in_users WHERE whatsapp_number = :num"),
-                {"num": whatsapp_number},
-            )
-
-        logging.info(f"✅ Successfully registered and marked terms accepted for user {whatsapp_number}")
-
-    except Exception as e:
-        logging.error(
-            f"❌ Error while registering user {whatsapp_number}: {e}",
-            exc_info=True,
-        )
-        raise
-
-
-# -----------------------------------------------------------------------------
-# Media: Save temp media references before ticket creation
-# -----------------------------------------------------------------------------
-def save_temp_media_to_db(sender_id, media_type, media_path, caption):
-    """
-    Saves a media reference temporarily in the database before ticket creation.
-    Expected columns:
-      temp_ticket_media(sender_id, media_type, media_path, caption, uploaded_at)
-
-    Returns True/False.
-    """
-    query = text("""
-        INSERT INTO temp_ticket_media (sender_id, media_type, media_path, caption, uploaded_at)
-        VALUES (:sender_id, :media_type, :media_path, :caption, :uploaded_at)
-    """)
-
-    try:
-        engine = get_db_connection1()
-        with engine.begin() as conn:
-            conn.execute(
-                query,
-                {
-                    "sender_id": sender_id,
-                    "media_type": media_type,
-                    "media_path": media_path,
-                    "caption": caption,
-                    "uploaded_at": kenya_now_db(),
-                },
-            )
-
-        logging.info(f"✅ Temp media saved for {sender_id}: {media_type} -> {media_path}")
         return True
-
     except Exception as e:
-        logging.error(
-            f"❌ Failed to insert temp media for {sender_id}: {e}",
-            exc_info=True,
-        )
+        logging.error("❌ Failed to upload media to Odoo ticket=%s file=%s error=%s", ticket_id, file_path, e, exc_info=True)
         return False
 
 
-# conn1.py (ADD THIS BELOW YOUR EXISTING FUNCTIONS)
+# This is not used for final persistence anymore. whatsapp.py keeps temp media in-memory.
+def save_temp_media_to_db(sender_id, media_type, media_path, caption):
+    logging.warning(
+        "save_temp_media_to_db called, but MySQL is disabled. "
+        "Temp media should be handled by whatsapp.py in-memory store."
+    )
+    return False
+
+
+# -----------------------------------------------------------------------------
+# WhatsApp message logging
+# -----------------------------------------------------------------------------
+def _normalise_direction(direction: str | None) -> str:
+    direction = (direction or "out").lower()
+    if direction in ("inbound", "incoming", "in"):
+        return "in"
+    return "out"
+
 
 def log_whatsapp_message(
     wa_number: str,
-    direction: str,          # "inbound" | "outbound"
-    message_type: str,       # "text" | "interactive" | "image" | "video" | "document" | "status" | "template"
+    direction: str,
+    message_type: str,
     body_text: str | None = None,
-    message_id: str | None = None,   # WA message id (wamid...) if available
+    message_id: str | None = None,
     template_name: str | None = None,
-    status: str | None = None,       # "sent" | "delivered" | "read" | "failed"
+    status: str | None = None,
     error_text: str | None = None,
-    meta_json: str | None = None,    # store raw payload summary if you want
+    meta_json: str | dict | None = None,
+    ticket_id: int | None = None,
+    job_card_id: int | None = None,
 ):
-    """
-    Writes to whatsapp_messages table (you need this table in the same DB).
-    Uses kenya_now_db() to match your MySQL DATETIME schema.
-    """
-    q = text("""
-        INSERT INTO whatsapp_messages
-            (wa_number, direction, message_type, body_text, message_id, template_name,
-             status, error_text, meta_json, created_at)
-        VALUES
-            (:wa_number, :direction, :message_type, :body_text, :message_id, :template_name,
-             :status, :error_text, :meta_json, :created_at)
-    """)
+    if isinstance(meta_json, (dict, list)):
+        meta_json = json.dumps(meta_json, ensure_ascii=False)
 
-    engine = get_db_connection1()
-    with engine.begin() as conn:
-        conn.execute(
-            q,
-            {
-                "wa_number": str(wa_number),
-                "direction": direction,
-                "message_type": message_type,
-                "body_text": body_text,
-                "message_id": message_id,
-                "template_name": template_name,
-                "status": status,
-                "error_text": error_text,
-                "meta_json": meta_json,
-                "created_at": kenya_now_db(),
-            },
-        )
+    payload: dict[str, Any] = {
+        "wa_number": str(wa_number),
+        "direction": _normalise_direction(direction),
+        "message_type": message_type,
+        "body_text": body_text,
+        "message_id": message_id,
+        "template_name": template_name,
+        "status": status,
+        "error_text": error_text,
+        "meta_json": meta_json,
+    }
+    if ticket_id:
+        payload["ticket_id"] = int(ticket_id)
+    if job_card_id:
+        payload["job_card_id"] = int(job_card_id)
+
+    try:
+        return odoo_post("/api/apricot_ticketing/log_message", payload)
+    except Exception as e:
+        logging.error("❌ Failed to log WhatsApp message in Odoo: %s", e, exc_info=True)
+        return {"ok": False, "error": str(e)}
 
 
 def update_whatsapp_message_status(message_id: str, status: str, error_text: str | None = None):
+    # Current Odoo endpoint logs status events. It does not update existing rows yet.
+    return log_whatsapp_message(
+        wa_number="unknown",
+        direction="outbound",
+        message_type="status",
+        message_id=message_id,
+        status=status,
+        error_text=error_text,
+    )
+
+
+def mark_message_as_processed_odoo(message_id: str) -> dict[str, Any]:
+    return odoo_post("/api/apricot_ticketing/mark_processed_message", {"message_id": message_id})
+
+
+def get_open_tickets(whatsapp_number: str) -> list[dict[str, Any]]:
+    """Return active tickets for a WhatsApp number from Odoo.
+
+    Requires the Odoo controller endpoint:
+      POST /api/apricot_ticketing/get_tickets
     """
-    Updates existing row by message_id (wamid) if you want status tracking.
-    """
-    q = text("""
-        UPDATE whatsapp_messages
-        SET status = :status,
-            error_text = :error_text
-        WHERE message_id = :message_id
-        LIMIT 1
-    """)
-    engine = get_db_connection1()
-    with engine.begin() as conn:
-        conn.execute(q, {"status": status, "error_text": error_text, "message_id": message_id})
+    try:
+        data = odoo_post(
+            "/api/apricot_ticketing/get_tickets",
+            {"whatsapp_number": whatsapp_number, "active_only": True},
+        )
+        return data.get("tickets") or []
+    except Exception as e:
+        logging.error("Failed to get Odoo open tickets for %s: %s", whatsapp_number, e, exc_info=True)
+        return []

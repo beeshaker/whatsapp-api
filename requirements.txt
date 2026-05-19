@@ -5,3 +5,5 @@ python-dotenv==1.0.1
 SQLAlchemy==2.0.29
 gunicorn==21.2.0
 requests
+qrcode[pil]
+tzdata
