@@ -1,1 +1,1 @@
-web: gunicorn whatsapp:app --workers 4 --threads 8 --bind 0.0.0.0:$PORT
+web: gunicorn whatsapp:app --workers=1 --threads=8 --timeout=120
